@@ -1,17 +1,18 @@
 diff --git a/fynd-core/src/algorithm/mod.rs b/fynd-core/src/algorithm/mod.rs
 --- a/fynd-core/src/algorithm/mod.rs
 +++ b/fynd-core/src/algorithm/mod.rs
-@@ -22,6 +22,7 @@
- 
+@@ -24,6 +24,7 @@
  pub mod bellman_ford;
 +mod concavity_audit;
  mod exact_v2_refiner;
  mod exact_v2_search;
  pub mod most_liquid;
+ pub mod path_frank_wolfe;
+ pub(crate) mod paths;
 diff --git a/fynd-core/src/algorithm/exact_v2_search.rs b/fynd-core/src/algorithm/exact_v2_search.rs
 --- a/fynd-core/src/algorithm/exact_v2_search.rs
 +++ b/fynd-core/src/algorithm/exact_v2_search.rs
-@@ -34,6 +34,10 @@ fn symbolic_cut_census_enabled() -> bool {
+@@ -38,6 +38,10 @@ fn symbolic_cut_census_enabled() -> bool {
      std::env::var_os("FYND_SYMBOLIC_ALLOCATION_CENSUS").is_some()
  }
  
@@ -20,7 +21,8 @@ diff --git a/fynd-core/src/algorithm/exact_v2_search.rs b/fynd-core/src/algorith
 +}
 +
  struct PathSearch<'a> {
-@@ -559,7 +563,8 @@ fn discover_paths(
+     ctx: &'a BellmanFordContext,
+@@ -618,7 +622,8 @@ fn discover_paths(
      total: &BigUint,
      max_hops: usize,
  ) -> Result<Vec<PathAllocation>, AlgorithmError> {
@@ -28,7 +30,11 @@ diff --git a/fynd-core/src/algorithm/exact_v2_search.rs b/fynd-core/src/algorith
 +    let collect_census =
 +        census_enabled() || symbolic_cut_census_enabled() || concavity_audit_enabled();
      let mut search = PathSearch {
-@@ -582,6 +587,9 @@ fn discover_paths(
+         ctx,
+@@ -632,7 +637,10 @@ fn discover_paths(
+     if census_enabled() {
+         emit_language_census(&search.census_paths, total, ctx);
+     }
      if symbolic_cut_census_enabled() {
          emit_symbolic_allocation_cut_census(&search.census_paths, total, ctx);
      }
