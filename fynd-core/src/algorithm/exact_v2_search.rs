@@ -156,7 +156,15 @@ fn combinations(
     used: &mut FxHashSet<String>,
     portfolios: &mut Vec<Vec<PathAllocation>>,
 ) -> Result<(), AlgorithmError> {
-    if selected.len() >= 2 {
+    // A newly discovered path is a valid competitor to the native single-path
+    // incumbent even when no split is useful. Previously the exact-search layer
+    // only emitted portfolios with at least two paths, so an independently
+    // discovered direct V3 route could never replace a weaker V2 incumbent by
+    // itself. Keep singleton paths in the same candidate stream; the caller's
+    // existing post-gas acceptance remains authoritative.
+    if selected.len() == 1 {
+        portfolios.push(selected.clone());
+    } else if selected.len() >= 2 {
         if let Ok(Some(allocation)) = refine_disjoint_allocations(selected, total, &ctx.market_data)
         {
             portfolios.push(allocation);
