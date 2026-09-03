@@ -80,6 +80,19 @@ fn replay_path(
     Ok(replayed)
 }
 
+fn zero_path(path: &PathAllocation) -> PathAllocation {
+    let mut zeroed = path.clone();
+    zeroed.flow_fraction = 0.0;
+    zeroed.amount_in = BigUint::zero();
+    zeroed.amount_out = BigUint::zero();
+    zeroed.marginal_price_product = 0.0;
+    for hop in &mut zeroed.hops {
+        hop.amount_out = BigUint::zero();
+        hop.gas = BigUint::zero();
+    }
+    zeroed
+}
+
 fn output(paths: &[PathAllocation]) -> BigUint {
     paths
         .iter()
@@ -181,18 +194,15 @@ fn refine_simulated_paths(
                     replay_path(&best[right], interior_right_amount, total, market)?;
                 let interior_output = &interior_left.amount_out + &interior_right.amount_out;
 
-                let zero = BigUint::zero();
                 let left_boundary_left =
                     replay_path(&best[left], pair_total.clone(), total, market)?;
-                let left_boundary_right = replay_path(&best[right], zero.clone(), total, market)?;
-                let left_boundary_output =
-                    &left_boundary_left.amount_out + &left_boundary_right.amount_out;
+                let left_boundary_right = zero_path(&best[right]);
+                let left_boundary_output = left_boundary_left.amount_out.clone();
 
-                let right_boundary_left = replay_path(&best[left], zero, total, market)?;
+                let right_boundary_left = zero_path(&best[left]);
                 let right_boundary_right =
                     replay_path(&best[right], pair_total.clone(), total, market)?;
-                let right_boundary_output =
-                    &right_boundary_left.amount_out + &right_boundary_right.amount_out;
+                let right_boundary_output = right_boundary_right.amount_out.clone();
 
                 let (left_path, right_path, new_pair) = if left_boundary_output > interior_output &&
                     left_boundary_output >= right_boundary_output
@@ -217,10 +227,7 @@ fn refine_simulated_paths(
         }
     }
 
-    // A feasible seed is itself a valid portfolio candidate. Requiring a strict
-    // improvement over the seed incorrectly discarded symmetric V3 portfolios:
-    // equal pools are already optimal at the equal seed and need no coordinate
-    // move before being compared against the native route.
+    best.retain(|path| !path.amount_in.is_zero());
     Ok(Some(best))
 }
 
