@@ -27,6 +27,44 @@ struct ContinuousCpmm {
     c: BigUint,
 }
 
+#[derive(Clone)]
+struct PositiveFraction {
+    numerator: BigUint,
+    denominator: BigUint,
+}
+
+impl PositiveFraction {
+    fn new(numerator: BigUint, denominator: BigUint) -> Option<Self> {
+        if denominator.is_zero() {
+            None
+        } else {
+            Some(Self { numerator, denominator })
+        }
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        Self {
+            numerator: &self.numerator * &other.denominator +
+                &other.numerator * &self.denominator,
+            denominator: &self.denominator * &other.denominator,
+        }
+    }
+
+    fn mul_uint(&self, value: &BigUint) -> Self {
+        Self {
+            numerator: &self.numerator * value,
+            denominator: self.denominator.clone(),
+        }
+    }
+
+    fn ceil(&self) -> BigUint {
+        if self.numerator.is_zero() {
+            return BigUint::zero();
+        }
+        (&self.numerator + &self.denominator - BigUint::from(1u8)) / &self.denominator
+    }
+}
+
 /// Refines pool-disjoint allocations. Pure V2 sets retain the closed-form
 /// allocator; mixed or V3 sets are refined with exact simulated replay.
 pub(super) fn refine_disjoint_allocations(
@@ -36,6 +74,35 @@ pub(super) fn refine_disjoint_allocations(
 ) -> Result<Option<Vec<PathAllocation>>, AlgorithmError> {
     if current.len() < 2 || !paths_are_pool_disjoint(current) {
         return Ok(None);
+    }
+
+    // Analysis-gated first production use of the V2 symbolic certificate.
+    //
+    // For a V2 path, exact integer execution is pointwise <= its continuous
+    // no-floor CPMM composition. For two paths the continuous coupled objective
+    // F*(x) = Q_left*(T-x) + Q_right*(x) is concave, so a tangent at any point is
+    // a global upper bound. If that bound over x in [0,T] cannot beat the best
+    // already-feasible full-order singleton, no exact split can beat it either.
+    //
+    // Returning that singleton is therefore correctness-preserving. The flag
+    // keeps the first corpus run differential and makes rollback trivial.
+    if std::env::var_os("FYND_V2_CERTIFIED_PRUNE").is_some() && current.len() == 2 {
+        if let Some(upper) = certified_v2_pair_upper(current, total, market) {
+            let incumbent_index = if current[1].amount_out > current[0].amount_out { 1 } else { 0 };
+            let incumbent = &current[incumbent_index].amount_out;
+            if upper <= *incumbent {
+                if std::env::var_os("FYND_V2_CERTIFIED_PRUNE_TRACE").is_some() {
+                    eprintln!(
+                        "v2-certified-prune: upper={} incumbent={} left_hops={} right_hops={}",
+                        upper,
+                        incumbent,
+                        current[0].hops.len(),
+                        current[1].hops.len()
+                    );
+                }
+                return Ok(Some(vec![current[incumbent_index].clone()]));
+            }
+        }
     }
 
     if let Some(refined) = allocate_uniswap_v2_paths(current, total, market)? {
@@ -255,6 +322,18 @@ impl ContinuousCpmm {
         }
     }
 
+    fn value(&self, amount: &BigUint) -> Option<PositiveFraction> {
+        PositiveFraction::new(
+            &self.a * amount,
+            &self.b + &self.c * amount,
+        )
+    }
+
+    fn derivative_fraction(&self, amount: &BigUint) -> Option<PositiveFraction> {
+        let base = &self.b + &self.c * amount;
+        PositiveFraction::new(&self.a * &self.b, &base * &base)
+    }
+
     fn allocation_at_marginal(&self, marginal: f64) -> f64 {
         let (Some(a), Some(b), Some(c)) = (self.a.to_f64(), self.b.to_f64(), self.c.to_f64())
         else {
@@ -297,6 +376,61 @@ fn path_curve(path: &PathAllocation, market: &MarketState) -> Option<ContinuousC
         });
     }
     curve
+}
+
+/// Sound upper bound on the exact output of a two-path V2 split over x in [0,T].
+///
+/// Let F*(x)=A*(T-x)+B*(x), where A* and B* are the continuous no-floor CPMM
+/// compositions. Exact integer replay is pointwise <= F*. F* is concave, hence
+/// its tangent at m=T/2 is a global upper bound. The maximum of that affine
+/// tangent on [0,T] occurs at an endpoint. Everything below is exact integer
+/// rational arithmetic; the final ceiling can only make the bound more
+/// conservative.
+fn certified_v2_pair_upper(
+    current: &[PathAllocation],
+    total: &BigUint,
+    market: &MarketState,
+) -> Option<BigUint> {
+    if current.len() != 2 || total.is_zero() {
+        return None;
+    }
+    let left = path_curve(&current[0], market)?;
+    let right = path_curve(&current[1], market)?;
+
+    let midpoint = total / BigUint::from(2u8);
+    let left_amount = total - &midpoint;
+    let left_value = left.value(&left_amount)?;
+    let right_value = right.value(&midpoint)?;
+    let value_at_mid = left_value.add(&right_value);
+
+    // dF/dx = B'(x) - A'(T-x).
+    let left_derivative = left.derivative_fraction(&left_amount)?;
+    let right_derivative = right.derivative_fraction(&midpoint)?;
+    let right_ge_left = &right_derivative.numerator * &left_derivative.denominator >=
+        &left_derivative.numerator * &right_derivative.denominator;
+
+    let slope_magnitude = if right_ge_left {
+        PositiveFraction::new(
+            &right_derivative.numerator * &left_derivative.denominator -
+                &left_derivative.numerator * &right_derivative.denominator,
+            &right_derivative.denominator * &left_derivative.denominator,
+        )?
+    } else {
+        PositiveFraction::new(
+            &left_derivative.numerator * &right_derivative.denominator -
+                &right_derivative.numerator * &left_derivative.denominator,
+            &right_derivative.denominator * &left_derivative.denominator,
+        )?
+    };
+
+    // If slope >= 0 the affine tangent is largest at x=T, otherwise at x=0.
+    let endpoint_distance = if right_ge_left {
+        total - &midpoint
+    } else {
+        midpoint.clone()
+    };
+    let tangent_endpoint = value_at_mid.add(&slope_magnitude.mul_uint(&endpoint_distance));
+    Some(tangent_endpoint.ceil())
 }
 
 fn allocations(curves: &[ContinuousCpmm], total: &BigUint) -> Option<Vec<BigUint>> {
@@ -430,5 +564,21 @@ mod tests {
         };
         let result = allocations(&[curve.clone(), curve], &BigUint::from(50u32)).unwrap();
         assert_eq!(result, [BigUint::from(25u32), BigUint::from(25u32)]);
+    }
+
+    #[test]
+    fn tangent_upper_bounds_equal_curves_at_endpoints() {
+        let curve = ContinuousCpmm {
+            a: BigUint::from(997_000u32),
+            b: BigUint::from(1_000_000u32),
+            c: BigUint::from(997u32),
+        };
+        let total = BigUint::from(50u32);
+        let midpoint = &total / BigUint::from(2u8);
+        let left_amount = &total - &midpoint;
+        let value = curve.value(&left_amount).unwrap().add(&curve.value(&midpoint).unwrap());
+        let upper = value.ceil();
+        let endpoint = curve.value(&total).unwrap().ceil();
+        assert!(upper >= endpoint);
     }
 }
