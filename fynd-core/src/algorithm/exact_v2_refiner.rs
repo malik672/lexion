@@ -19,6 +19,8 @@ use super::{
 };
 use crate::feed::market_data::MarketState;
 
+const CERTIFIED_INTERVAL_DEPTH: usize = 6;
+
 #[derive(Clone)]
 struct ContinuousCpmm {
     // Continuous no-floor envelope q(x) = a*x / (b + c*x).
@@ -74,6 +76,10 @@ pub(super) fn refine_disjoint_allocations(
 ) -> Result<Option<Vec<PathAllocation>>, AlgorithmError> {
     if current.len() < 2 || !paths_are_pool_disjoint(current) {
         return Ok(None);
+    }
+
+    if std::env::var_os("FYND_V2_CERTIFIED_INTERVAL_CENSUS").is_some() && current.len() == 2 {
+        emit_v2_certified_interval_census(current, total, market);
     }
 
     // Analysis-gated first production use of the V2 symbolic certificate.
@@ -378,30 +384,20 @@ fn path_curve(path: &PathAllocation, market: &MarketState) -> Option<ContinuousC
     curve
 }
 
-/// Sound upper bound on the exact output of a two-path V2 split over x in [0,T].
-///
-/// Let F*(x)=A*(T-x)+B*(x), where A* and B* are the continuous no-floor CPMM
-/// compositions. Exact integer replay is pointwise <= F*. F* is concave, hence
-/// its tangent at m=T/2 is a global upper bound. The maximum of that affine
-/// tangent on [0,T] occurs at an endpoint. Everything below is exact integer
-/// rational arithmetic; the final ceiling can only make the bound more
-/// conservative.
-fn certified_v2_pair_upper(
-    current: &[PathAllocation],
+fn certified_v2_interval_upper_from_curves(
+    left: &ContinuousCpmm,
+    right: &ContinuousCpmm,
     total: &BigUint,
-    market: &MarketState,
+    lo: &BigUint,
+    hi: &BigUint,
 ) -> Option<BigUint> {
-    if current.len() != 2 || total.is_zero() {
+    if lo > hi || hi > total {
         return None;
     }
-    let left = path_curve(&current[0], market)?;
-    let right = path_curve(&current[1], market)?;
 
-    let midpoint = total / BigUint::from(2u8);
+    let midpoint = (lo + hi) / BigUint::from(2u8);
     let left_amount = total - &midpoint;
-    let left_value = left.value(&left_amount)?;
-    let right_value = right.value(&midpoint)?;
-    let value_at_mid = left_value.add(&right_value);
+    let value_at_mid = left.value(&left_amount)?.add(&right.value(&midpoint)?);
 
     // dF/dx = B'(x) - A'(T-x).
     let left_derivative = left.derivative_fraction(&left_amount)?;
@@ -423,14 +419,198 @@ fn certified_v2_pair_upper(
         )?
     };
 
-    // If slope >= 0 the affine tangent is largest at x=T, otherwise at x=0.
+    // The tangent is affine. Its maximum on [lo, hi] is therefore the endpoint
+    // in the direction of its slope.
     let endpoint_distance = if right_ge_left {
-        total - &midpoint
+        hi - &midpoint
     } else {
-        midpoint.clone()
+        &midpoint - lo
     };
-    let tangent_endpoint = value_at_mid.add(&slope_magnitude.mul_uint(&endpoint_distance));
-    Some(tangent_endpoint.ceil())
+    Some(
+        value_at_mid
+            .add(&slope_magnitude.mul_uint(&endpoint_distance))
+            .ceil(),
+    )
+}
+
+/// Sound upper bound on the exact output of a two-path V2 split over x in [0,T].
+fn certified_v2_pair_upper(
+    current: &[PathAllocation],
+    total: &BigUint,
+    market: &MarketState,
+) -> Option<BigUint> {
+    if current.len() != 2 || total.is_zero() {
+        return None;
+    }
+    let left = path_curve(&current[0], market)?;
+    let right = path_curve(&current[1], market)?;
+    certified_v2_interval_upper_from_curves(
+        &left,
+        &right,
+        total,
+        &BigUint::zero(),
+        total,
+    )
+}
+
+#[derive(Default)]
+struct V2CertifiedIntervalStats {
+    intervals: usize,
+    certified_dead: usize,
+    unresolved_leaves: usize,
+    dead_width: BigUint,
+    dead_by_depth: [usize; CERTIFIED_INTERVAL_DEPTH + 1],
+    falsifier_probes: usize,
+    falsifier_unknown: usize,
+    falsifier_violations: usize,
+}
+
+fn exact_pair_output(
+    current: &[PathAllocation],
+    total: &BigUint,
+    market: &MarketState,
+    x: &BigUint,
+) -> Option<BigUint> {
+    if current.len() != 2 || x > total {
+        return None;
+    }
+    let left_amount = total - x;
+    let left = replay_path(&current[0], left_amount, total, market).ok()?;
+    let right = replay_path(&current[1], x.clone(), total, market).ok()?;
+    Some(left.amount_out + right.amount_out)
+}
+
+fn analyze_v2_certified_interval(
+    current: &[PathAllocation],
+    left: &ContinuousCpmm,
+    right: &ContinuousCpmm,
+    total: &BigUint,
+    market: &MarketState,
+    incumbent: &BigUint,
+    lo: BigUint,
+    hi: BigUint,
+    depth: usize,
+    stats: &mut V2CertifiedIntervalStats,
+) {
+    stats.intervals += 1;
+    let Some(upper) = certified_v2_interval_upper_from_curves(left, right, total, &lo, &hi)
+    else {
+        stats.unresolved_leaves += 1;
+        return;
+    };
+
+    let midpoint = (&lo + &hi) / BigUint::from(2u8);
+    if upper <= *incumbent {
+        stats.certified_dead += 1;
+        stats.dead_by_depth[depth] += 1;
+        stats.dead_width += &hi - &lo;
+
+        // The tangent proof is the certificate. These exact probes are only a
+        // differential guard against implementation mistakes in the certificate.
+        for x in [&lo, &midpoint, &hi] {
+            match exact_pair_output(current, total, market, x) {
+                Some(exact) => {
+                    stats.falsifier_probes += 1;
+                    if exact > *incumbent {
+                        stats.falsifier_violations += 1;
+                    }
+                }
+                None => stats.falsifier_unknown += 1,
+            }
+        }
+        return;
+    }
+
+    if depth == CERTIFIED_INTERVAL_DEPTH || lo == hi {
+        stats.unresolved_leaves += 1;
+        return;
+    }
+
+    analyze_v2_certified_interval(
+        current,
+        left,
+        right,
+        total,
+        market,
+        incumbent,
+        lo.clone(),
+        midpoint.clone(),
+        depth + 1,
+        stats,
+    );
+    analyze_v2_certified_interval(
+        current,
+        left,
+        right,
+        total,
+        market,
+        incumbent,
+        midpoint,
+        hi,
+        depth + 1,
+        stats,
+    );
+}
+
+fn emit_v2_certified_interval_census(
+    current: &[PathAllocation],
+    total: &BigUint,
+    market: &MarketState,
+) {
+    if current.len() != 2 || total.is_zero() {
+        return;
+    }
+    let (Some(left), Some(right)) = (
+        path_curve(&current[0], market),
+        path_curve(&current[1], market),
+    ) else {
+        return;
+    };
+
+    let incumbent = current[0].amount_out.clone().max(current[1].amount_out.clone());
+    let mut stats = V2CertifiedIntervalStats::default();
+    analyze_v2_certified_interval(
+        current,
+        &left,
+        &right,
+        total,
+        market,
+        &incumbent,
+        BigUint::zero(),
+        total.clone(),
+        0,
+        &mut stats,
+    );
+
+    let dead_bps = if total.is_zero() {
+        0u64
+    } else {
+        ((&stats.dead_width * BigUint::from(10_000u64)) / total)
+            .to_u64()
+            .unwrap_or(10_000)
+            .min(10_000)
+    };
+
+    eprintln!("\n=== V2CertifiedIntervalCensusV1 ===");
+    eprintln!("left hops:                    {}", current[0].hops.len());
+    eprintln!("right hops:                   {}", current[1].hops.len());
+    eprintln!("incumbent gross raw:          {}", incumbent);
+    eprintln!("interval nodes examined:      {}", stats.intervals);
+    eprintln!("certified-dead intervals:     {}", stats.certified_dead);
+    eprintln!("unresolved depth-6 leaves:    {}", stats.unresolved_leaves);
+    eprintln!(
+        "allocation width dead:        {}.{:02}%",
+        dead_bps / 100,
+        dead_bps % 100
+    );
+    eprintln!("exact falsifier probes:       {}", stats.falsifier_probes);
+    eprintln!("falsifier unknown probes:     {}", stats.falsifier_unknown);
+    eprintln!("certificate violations:       {}", stats.falsifier_violations);
+    eprintln!("dead intervals by depth:");
+    for (depth, count) in stats.dead_by_depth.iter().enumerate() {
+        eprintln!("  depth {}: {}", depth, count);
+    }
+    eprintln!("=== end V2CertifiedIntervalCensusV1 ===\n");
 }
 
 fn allocations(curves: &[ContinuousCpmm], total: &BigUint) -> Option<Vec<BigUint>> {
@@ -580,5 +760,32 @@ mod tests {
         let upper = value.ceil();
         let endpoint = curve.value(&total).unwrap().ceil();
         assert!(upper >= endpoint);
+    }
+
+    #[test]
+    fn interval_tangent_tightens_on_equal_curves() {
+        let curve = ContinuousCpmm {
+            a: BigUint::from(997_000u32),
+            b: BigUint::from(1_000_000u32),
+            c: BigUint::from(997u32),
+        };
+        let total = BigUint::from(100u32);
+        let root = certified_v2_interval_upper_from_curves(
+            &curve,
+            &curve,
+            &total,
+            &BigUint::zero(),
+            &total,
+        )
+        .unwrap();
+        let half = certified_v2_interval_upper_from_curves(
+            &curve,
+            &curve,
+            &total,
+            &BigUint::zero(),
+            &BigUint::from(50u32),
+        )
+        .unwrap();
+        assert!(half <= root);
     }
 }
