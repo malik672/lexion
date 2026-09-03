@@ -13,17 +13,26 @@ shift "$(( $# < 3 ? $# : 3 ))"
 
 # Keep the convenient historical trailing `live` shorthand, but translate it
 # into the clap form the benchmark actually accepts: `--market live`.
+# The live shorthand intentionally narrows Tycho to Uniswap V2/V3, which are
+# the protocols this comparison is designed to exercise and which are
+# available on the standard Fynd Tycho plan. An explicit --protocols supplied
+# by the caller always wins.
 BENCH_ARGS=()
 IS_LIVE=0
+HAS_PROTOCOLS=0
 for argument in "$@"; do
   if [[ "$argument" == "live" ]]; then
     IS_LIVE=1
   else
+    [[ "$argument" == "--protocols" || "$argument" == --protocols=* ]] && HAS_PROTOCOLS=1
     BENCH_ARGS+=("$argument")
   fi
 done
 if [[ $IS_LIVE -eq 1 ]]; then
   BENCH_ARGS+=(--market live)
+  if [[ $HAS_PROTOCOLS -eq 0 ]]; then
+    BENCH_ARGS+=(--protocols uniswap_v2,uniswap_v3)
+  fi
 fi
 
 FIXTURE="fynd-core/tests/fixtures/market_recording.json.zst"
