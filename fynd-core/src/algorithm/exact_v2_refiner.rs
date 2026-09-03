@@ -122,13 +122,19 @@ fn feasible_seed(
         .collect()
 }
 
-/// Improves an existing V2/V3 split using exact simulator replays. Each
-/// coordinate step preserves the pair's total input, then accepts only an
-/// exact integer-output improvement. The initial state is always a feasible
-/// allocation whose inputs sum to the order amount. This matters for
-/// independently discovered portfolios, where every path was originally
-/// quoted at the full order amount and therefore cannot itself be used as an
-/// optimization seed.
+/// Improves an existing V2/V3 split using exact simulator replays.
+///
+/// For a fixed pool-disjoint portfolio the continuous exact-input output of a
+/// V2/V3 path is increasing and concave: V3 is piecewise constant-product and
+/// price moves monotonically against the trade, while composition preserves
+/// concavity for increasing hop functions. Therefore the pair objective
+/// `Q_left(x) + Q_right(K-x)` is concave in the continuous relaxation.
+///
+/// Golden-section search is useful for the interior, but a concave maximum may
+/// occur at either boundary. We therefore replay both `(0, K)` and `(K, 0)`
+/// explicitly and compare them with the interior proposal using exact integer
+/// simulator output. This also lets dominated paths leave the allocation
+/// completely instead of being forced to retain golden-section dust.
 fn refine_simulated_paths(
     current: &[PathAllocation],
     total: &BigUint,
@@ -136,9 +142,11 @@ fn refine_simulated_paths(
 ) -> Result<Option<Vec<PathAllocation>>, AlgorithmError> {
     let mut best = feasible_seed(current, total, market)?;
 
-    // A small fixed number of coordinate passes keeps V3 replay bounded while
-    // handling splits with more than two paths.
-    for _ in 0..3 {
+    // Four passes were enough to converge very closely to the global continuous
+    // reference in the synthetic concentrated-liquidity differential harness.
+    // Exact replay remains authoritative because integer rounding can perturb
+    // the continuous concavity model by a few raw output units.
+    for _ in 0..4 {
         let mut changed = false;
         for left in 0..best.len() {
             for right in left + 1..best.len() {
@@ -164,12 +172,39 @@ fn refine_simulated_paths(
                     1.0,
                     16,
                 );
-                let (left_amount, right_amount) = split_amount(&pair_total, split);
-                let left_path = replay_path(&best[left], left_amount, total, market)?;
-                let right_path = replay_path(&best[right], right_amount, total, market)?;
+
+                let (interior_left_amount, interior_right_amount) =
+                    split_amount(&pair_total, split);
+                let interior_left =
+                    replay_path(&best[left], interior_left_amount, total, market)?;
+                let interior_right =
+                    replay_path(&best[right], interior_right_amount, total, market)?;
+                let interior_output = &interior_left.amount_out + &interior_right.amount_out;
+
+                let zero = BigUint::zero();
+                let left_boundary_left =
+                    replay_path(&best[left], pair_total.clone(), total, market)?;
+                let left_boundary_right = replay_path(&best[right], zero.clone(), total, market)?;
+                let left_boundary_output =
+                    &left_boundary_left.amount_out + &left_boundary_right.amount_out;
+
+                let right_boundary_left = replay_path(&best[left], zero, total, market)?;
+                let right_boundary_right =
+                    replay_path(&best[right], pair_total.clone(), total, market)?;
+                let right_boundary_output =
+                    &right_boundary_left.amount_out + &right_boundary_right.amount_out;
+
+                let (left_path, right_path, new_pair) = if left_boundary_output > interior_output &&
+                    left_boundary_output >= right_boundary_output
+                {
+                    (left_boundary_left, left_boundary_right, left_boundary_output)
+                } else if right_boundary_output > interior_output {
+                    (right_boundary_left, right_boundary_right, right_boundary_output)
+                } else {
+                    (interior_left, interior_right, interior_output)
+                };
 
                 let old_pair = &best[left].amount_out + &best[right].amount_out;
-                let new_pair = &left_path.amount_out + &right_path.amount_out;
                 if new_pair > old_pair {
                     best[left] = left_path;
                     best[right] = right_path;
