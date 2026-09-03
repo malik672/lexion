@@ -11,7 +11,9 @@ use num_traits::{One, ToPrimitive, Zero};
 use tycho_simulation::evm::protocol::uniswap_v2::state::UniswapV2State;
 
 use super::super::{
-    split_primitives::{simulate_path, HopDescriptor, MarketOverrides, PathAllocation},
+    split_primitives::{
+        simulate_path, HopDescriptor, MarketOverrides, PathAllocation, SimulatedHop,
+    },
     AlgorithmError,
 };
 use crate::feed::market_data::MarketState;
@@ -268,6 +270,27 @@ fn leaf_points(left: &Curve, right: &Curve, total: &BigUint, lo: &BigUint, hi: &
     points
 }
 
+fn build_full_path(
+    descriptors: &[HopDescriptor],
+    total: &BigUint,
+    market: &MarketState,
+) -> Result<PathAllocation, AlgorithmError> {
+    let sim = simulate_path(descriptors, total, market, &MarketOverrides::empty())?;
+    let hops = descriptors
+        .iter()
+        .cloned()
+        .zip(sim.hop_results)
+        .map(|(descriptor, (amount_out, gas))| SimulatedHop { descriptor, amount_out, gas })
+        .collect();
+    Ok(PathAllocation {
+        hops,
+        flow_fraction: 1.0,
+        amount_in: total.clone(),
+        amount_out: sim.amount_out,
+        marginal_price_product: sim.marginal_price_product,
+    })
+}
+
 pub(super) fn shadow_compare(
     current: &[PathAllocation],
     total: &BigUint,
@@ -341,4 +364,20 @@ pub(super) fn shadow_compare(
         stats.replays,
     );
     Ok(())
+}
+
+pub(super) fn shadow_compare_descriptors(
+    left: &[HopDescriptor],
+    right: &[HopDescriptor],
+    total: &BigUint,
+    market: &MarketState,
+) -> Result<(), AlgorithmError> {
+    let current = vec![
+        build_full_path(left, total, market)?,
+        build_full_path(right, total, market)?,
+    ];
+    let Some(baseline) = super::allocate_uniswap_v2_paths(&current, total, market)? else {
+        return Ok(());
+    };
+    shadow_compare(&current, total, market, &baseline)
 }
