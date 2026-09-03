@@ -37,6 +37,12 @@ The live quote is a snapshot simulation, not an executable-trade guarantee. Prod
 - `fynd-core/src/algorithm/path_frank_wolfe.rs`: baseline-to-hybrid integration.
 - `scripts/`: benchmark, randomized campaign, and live-quote helpers.
 
+## Research direction: canonical flow-DAG search
+
+The bounded hybrid is also the experimental base for a deeper exact-routing design derived from exact compiler-scheduling work: search canonical future-observable flow topologies instead of ordered swap histories, merge histories that differ only by commuting independent swaps, prune states that cannot jointly complete to the destination under the remaining pool resources, and solve amounts with topology-specific analytic or simulator-backed methods.
+
+The design and its correctness obligations are documented in [`docs/canonical-flow-dag-search.md`](docs/canonical-flow-dag-search.md). It is research work, not a claim about the current production path.
+
 ## Attribution
 
 This workspace is based on [Fynd](https://github.com/propeller-heads/fynd), whose simulator and market graph make exact route replay possible. Tycho is an infrastructure dependency used for live market data; it is not the algorithm described here.
