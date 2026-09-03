@@ -3,6 +3,7 @@
 /.vscode/
 clients/typescript/client/dist/
 clients/typescript/node_modules/
+tools/uniswap-router-bench/node_modules/
 # Benchmark run output. Regenerate it with ./scripts/bench.sh; paste report.md into a pull request
 # rather than committing the directory.
 bench-results/**/*.csv
