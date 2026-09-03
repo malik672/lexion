@@ -26,16 +26,86 @@ function currency(address, metadata) {
   return new Token(CHAIN_ID, address, Number(decimals), symbol);
 }
 
-function parseRunContext(reportText) {
-  const block = reportText.match(/market\s+live ethereum block\s+(\d+)/i);
-  const gas = reportText.match(/gas price\s+([0-9.]+)\s+gwei/i);
-  if (!block) throw new Error('could not find captured live block in report.md');
-  if (!gas) throw new Error('could not find gas price in report.md');
+function walk(object, visit) {
+  if (object == null || typeof object !== 'object') return;
+  for (const [key, value] of Object.entries(object)) {
+    visit(key, value);
+    if (value != null && typeof value === 'object') walk(value, visit);
+  }
+}
+
+function contextFromRunJson(run) {
+  let blockNumber = null;
+  let gasPriceGwei = null;
+  let gasPriceWei = null;
+
+  walk(run, (key, value) => {
+    const normalized = key.toLowerCase();
+    if (
+      blockNumber == null &&
+      (normalized === 'block' || normalized === 'block_number' || normalized === 'blocknumber') &&
+      /^\d+$/.test(String(value))
+    ) {
+      blockNumber = Number(value);
+    }
+
+    if (gasPriceGwei == null && /gas.*price.*gwei|gas_price_gwei/.test(normalized)) {
+      const candidate = Number(value);
+      if (Number.isFinite(candidate) && candidate >= 0) gasPriceGwei = String(value);
+    }
+
+    if (gasPriceWei == null && /gas.*price.*wei|gas_price_wei|market_gas_price/.test(normalized)) {
+      const text = String(value);
+      if (/^\d+$/.test(text)) gasPriceWei = ethers.BigNumber.from(text);
+    }
+  });
+
+  if (gasPriceGwei != null && gasPriceWei == null) {
+    gasPriceWei = ethers.utils.parseUnits(gasPriceGwei, 'gwei');
+  }
+  if (gasPriceWei != null && gasPriceGwei == null) {
+    gasPriceGwei = ethers.utils.formatUnits(gasPriceWei, 'gwei');
+  }
+
+  if (blockNumber == null || gasPriceWei == null) return null;
+  return { blockNumber, gasPriceGwei, gasPriceWei };
+}
+
+function contextFromReport(reportText) {
+  const block =
+    reportText.match(/live[^\n\r]*?block[^0-9]*(\d{7,})/i) ||
+    reportText.match(/block[^0-9]*(\d{7,})/i);
+  const gas =
+    reportText.match(/gas[^\n\r]*?price[^0-9]*([0-9]+(?:\.[0-9]+)?)\s*gwei/i) ||
+    reportText.match(/([0-9]+(?:\.[0-9]+)?)\s*gwei/i);
+  if (!block || !gas) return null;
   return {
     blockNumber: Number(block[1]),
     gasPriceGwei: gas[1],
     gasPriceWei: ethers.utils.parseUnits(gas[1], 'gwei'),
   };
+}
+
+function parseRunContext(runDir) {
+  const runPath = path.join(runDir, 'run.json');
+  if (fs.existsSync(runPath)) {
+    try {
+      const context = contextFromRunJson(JSON.parse(fs.readFileSync(runPath, 'utf8')));
+      if (context) return context;
+    } catch (error) {
+      console.warn(`warning: could not parse ${runPath}: ${error.message}`);
+    }
+  }
+
+  const reportPath = path.join(runDir, 'report.md');
+  if (fs.existsSync(reportPath)) {
+    const context = contextFromReport(fs.readFileSync(reportPath, 'utf8'));
+    if (context) return context;
+  }
+
+  throw new Error(
+    `could not find captured live block and gas price in ${runPath} or ${reportPath}`
+  );
 }
 
 function protocolLabel(entry) {
@@ -61,9 +131,7 @@ async function main() {
   if (!rpcUrl) die('RPC_URL is not set');
 
   const ordersPath = path.join(runDir, 'orders.csv');
-  const reportPath = path.join(runDir, 'report.md');
   if (!fs.existsSync(ordersPath)) die(`${ordersPath} does not exist`);
-  if (!fs.existsSync(reportPath)) die(`${reportPath} does not exist`);
 
   const tokenPath = path.resolve(__dirname, '../../fynd-core/benches/tokens.json');
   const metadata = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
@@ -71,7 +139,7 @@ async function main() {
   const hybridRows = rows.filter((row) => row.config === HYBRID_CONFIG && row.solved === 'true');
   if (!hybridRows.length) die(`no solved ${HYBRID_CONFIG} rows in ${ordersPath}`);
 
-  const context = parseRunContext(fs.readFileSync(reportPath, 'utf8'));
+  const context = parseRunContext(runDir);
   const provider = new ethers.providers.JsonRpcProvider(rpcUrl, CHAIN_ID);
   const gasPriceProvider = {
     async getGasPrice() {
