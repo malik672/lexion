@@ -1,0 +1,1107 @@
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { FyndClient } from './client.js';
+import { FyndError } from './error.js';
+import type { EthProvider, MinimalReceipt, FyndClientOptions } from './client.js';
+import type { Address, Hex } from './types.js';
+
+const ROUTER      = '0x1111111111111111111111111111111111111111' as Address;
+const PERMIT2     = '0x000000000022D473030F116dDEE9F6B43aC78BA3' as Address;
+const SENDER      = '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045' as Address;
+const TOKEN_IN    = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' as Address;
+const TOKEN_OUT   = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' as Address;
+const TOKEN_IN_ADDR = TOKEN_IN;
+
+// Build a mock provider with all methods returning sensible defaults
+function makeMockProvider(): { [K in keyof Required<EthProvider>]: ReturnType<typeof vi.fn> } & Required<EthProvider> {
+  return {
+    getTransactionCount:    vi.fn().mockResolvedValue(5),
+    estimateFeesPerGas:     vi.fn().mockResolvedValue({ maxFeePerGas: 20n, maxPriorityFeePerGas: 2n }),
+    call:                   vi.fn().mockResolvedValue({ data: undefined }),
+    estimateGas:            vi.fn().mockResolvedValue(150000n),
+    sendRawTransaction:     vi.fn().mockResolvedValue('0xtxhash' as Hex),
+    getTransactionReceipt:  vi.fn().mockResolvedValue(null),
+    readAllowance:          vi.fn().mockResolvedValue(0n),
+  };
+}
+
+type MockResponse = { status: number; data?: unknown };
+
+// Minimal mock that replaces the openapi-fetch HTTP layer
+function makeClientWithHttpMock(
+  solveResponse: MockResponse,
+  healthResponse?: MockResponse,
+  opts?: Partial<FyndClientOptions>,
+  infoResponse?: MockResponse,
+): FyndClient {
+  const client = new FyndClient({
+    baseUrl: 'http://localhost:8080',
+    sender:  SENDER,
+    ...opts,
+  });
+
+  function resolveResponse(resp: MockResponse | undefined) {
+    if (resp === undefined) return Promise.resolve({ data: undefined, error: undefined, response: {} });
+    if (resp.status >= 200 && resp.status < 300) {
+      return Promise.resolve({ data: resp.data, error: undefined, response: {} });
+    }
+    return Promise.resolve({ data: undefined, error: resp.data, response: {} });
+  }
+
+  // Override the private http client by accessing it via a cast
+  const httpMock = {
+    POST: vi.fn().mockImplementation(() => resolveResponse(solveResponse)),
+    GET: vi.fn().mockImplementation((path: string) => {
+      if (path === '/v1/info') return resolveResponse(infoResponse);
+      return resolveResponse(healthResponse);
+    }),
+  };
+  (client as any).http = httpMock;
+  return client;
+}
+
+// Pre-populate the infoPromise cache so tests don't need a live /v1/info endpoint.
+function seedInfo(client: FyndClient): void {
+  (client as any).infoPromise = Promise.resolve({
+    chainId: 1,
+    routerAddress: ROUTER,
+    permit2Address: PERMIT2,
+  });
+}
+
+const wireSolution = {
+  orders: [
+    {
+      order_id:           'order-1',
+      status:             'success',
+      amount_in:          '1000',
+      amount_out:         '3500',
+      amount_out_net_gas: '3498',
+      gas_estimate:       '150000',
+      route:              null,
+      price_impact_bps:   null,
+      block: { hash: '0xabc', number: 100, timestamp: 1000000 },
+    },
+  ],
+  total_gas_estimate: '150000',
+  solve_time_ms:      10,
+};
+
+describe('FyndClient.quote — happy path', () => {
+  it('returns a Quote with correct fields', async () => {
+    const client = makeClientWithHttpMock({ status: 200, data: wireSolution });
+    const quote = await client.quote({
+      order: { tokenIn: TOKEN_IN, tokenOut: TOKEN_OUT, amount: 1000n, side: 'sell', sender: SENDER },
+    });
+    expect(quote.orderId).toBe('order-1');
+    expect(quote.status).toBe('success');
+    expect(quote.backend).toBe('fynd');
+    expect(quote.amountIn).toBe(1000n);
+    expect(quote.amountOut).toBe(3500n);
+    expect(quote.gasEstimate).toBe(150000n);
+    expect(quote.tokenOut).toBe(TOKEN_OUT);
+  });
+
+  it('receiver defaults to sender when Order.receiver is absent', async () => {
+    const client = makeClientWithHttpMock({ status: 200, data: wireSolution });
+    const quote = await client.quote({
+      order: { tokenIn: TOKEN_IN, tokenOut: TOKEN_OUT, amount: 1000n, side: 'sell', sender: SENDER },
+    });
+    expect(quote.receiver).toBe(SENDER);
+  });
+
+  it('receiver uses Order.receiver when present', async () => {
+    const altReceiver = '0x2222222222222222222222222222222222222222' as Address;
+    const client = makeClientWithHttpMock({ status: 200, data: wireSolution });
+    const quote = await client.quote({
+      order: {
+        tokenIn:  TOKEN_IN,
+        tokenOut: TOKEN_OUT,
+        amount:   1000n,
+        side:     'sell',
+        sender:   SENDER,
+        receiver: altReceiver,
+      },
+    });
+    expect(quote.receiver).toBe(altReceiver);
+  });
+});
+
+describe('FyndClient.quote — error path', () => {
+  it('throws FyndError with NO_ROUTE_FOUND code', async () => {
+    const client = makeClientWithHttpMock({
+      status: 422,
+      data:   { code: 'NO_ROUTE_FOUND', error: 'no route' },
+    });
+    await expect(
+      client.quote({
+        order: { tokenIn: TOKEN_IN, tokenOut: TOKEN_OUT, amount: 1000n, side: 'sell', sender: SENDER },
+      }),
+    ).rejects.toThrow(FyndError);
+
+    try {
+      await client.quote({
+        order: { tokenIn: TOKEN_IN, tokenOut: TOKEN_OUT, amount: 1000n, side: 'sell', sender: SENDER },
+      });
+    } catch (e) {
+      expect(e instanceof FyndError).toBe(true);
+      if (e instanceof FyndError) {
+        expect(e.code).toBe('NO_ROUTE_FOUND');
+        expect(e.isRetryable()).toBe(false);
+      }
+    }
+  });
+});
+
+describe('FyndClient.quote — retry path', () => {
+  it('retries on QUEUE_FULL and succeeds on second attempt', async () => {
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      retry:   { maxAttempts: 3, initialBackoffMs: 1, maxBackoffMs: 10 },
+    });
+
+    let callCount = 0;
+    const httpMock = {
+      POST: vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve({
+            data:     undefined,
+            error:    { code: 'QUEUE_FULL', error: 'queue full' },
+            response: {},
+          });
+        }
+        return Promise.resolve({ data: wireSolution, error: undefined, response: {} });
+      }),
+      GET: vi.fn(),
+    };
+    (client as any).http = httpMock;
+
+    const quote = await client.quote({
+      order: { tokenIn: TOKEN_IN, tokenOut: TOKEN_OUT, amount: 1000n, side: 'sell', sender: SENDER },
+    });
+    expect(callCount).toBe(2);
+    expect(quote.status).toBe('success');
+  });
+
+  it('does not retry on non-retryable errors', async () => {
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      retry:   { maxAttempts: 3, initialBackoffMs: 1 },
+    });
+
+    let callCount = 0;
+    const httpMock = {
+      POST: vi.fn().mockImplementation(() => {
+        callCount++;
+        return Promise.resolve({
+          data:     undefined,
+          error:    { code: 'BAD_REQUEST', error: 'bad request' },
+          response: {},
+        });
+      }),
+      GET: vi.fn(),
+    };
+    (client as any).http = httpMock;
+
+    await expect(
+      client.quote({
+        order: { tokenIn: TOKEN_IN, tokenOut: TOKEN_OUT, amount: 1000n, side: 'sell', sender: SENDER },
+      }),
+    ).rejects.toThrow(FyndError);
+    expect(callCount).toBe(1);
+  });
+
+  it('exhausts all retries and throws on all-retryable failure', async () => {
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      retry:   { maxAttempts: 2, initialBackoffMs: 1, maxBackoffMs: 5 },
+    });
+
+    let callCount = 0;
+    const httpMock = {
+      POST: vi.fn().mockImplementation(() => {
+        callCount++;
+        return Promise.resolve({
+          data:     undefined,
+          error:    { code: 'QUEUE_FULL', error: 'queue full' },
+          response: {},
+        });
+      }),
+      GET: vi.fn(),
+    };
+    (client as any).http = httpMock;
+
+    await expect(
+      client.quote({
+        order: { tokenIn: TOKEN_IN, tokenOut: TOKEN_OUT, amount: 1000n, side: 'sell', sender: SENDER },
+      }),
+    ).rejects.toThrow(FyndError);
+    // All attempts should have been made before giving up
+    expect(callCount).toBe(2);
+  });
+});
+
+describe('FyndClient.health', () => {
+  it('returns HealthStatus on 200', async () => {
+    const client = makeClientWithHttpMock(
+      { status: 200, data: wireSolution },
+      { status: 200, data: { healthy: true, last_update_ms: 500, num_solver_pools: 3 } },
+    );
+    const health = await client.health();
+    expect(health.healthy).toBe(true);
+    expect(health.lastUpdateMs).toBe(500);
+    expect(health.numSolverPools).toBe(3);
+  });
+
+  it('throws FyndError on 503', async () => {
+    const client = makeClientWithHttpMock(
+      { status: 200, data: wireSolution },
+      { status: 503, data: { code: 'STALE_DATA', error: 'data stale' } },
+    );
+    await expect(client.health()).rejects.toThrow(FyndError);
+  });
+});
+
+describe('FyndClient.swapPayload', () => {
+  it('throws for turbine backend (not yet implemented)', async () => {
+    const provider = makeMockProvider();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    const turbineQuote = { ...makeDummyQuote(), backend: 'turbine' as const };
+    await expect(client.swapPayload(turbineQuote)).rejects.toThrow(
+      'not implemented: Turbine backend signing',
+    );
+  });
+
+  it('throws CONFIG error when provider is not set', async () => {
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+    });
+    const quote = { ...makeDummyQuote() };
+    await expect(client.swapPayload(quote)).rejects.toThrow(FyndError);
+    try {
+      await client.swapPayload(quote);
+    } catch (e) {
+      expect(e instanceof FyndError && e.code).toBe('CONFIG');
+    }
+  });
+
+  it('throws CONFIG error when no sender configured', async () => {
+    const provider = makeMockProvider();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      provider,
+      // no sender
+    });
+    const quote = makeDummyQuote();
+    await expect(client.swapPayload(quote)).rejects.toThrow(FyndError);
+    try {
+      await client.swapPayload(quote);
+    } catch (e) {
+      expect(e instanceof FyndError && e.code).toBe('CONFIG');
+    }
+  });
+
+  it('builds transaction with correct to, value, and data from quote.transaction', async () => {
+    const provider = makeMockProvider();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    seedInfo(client);
+    const quote = makeDummyQuote();
+    const payload = await client.swapPayload(quote);
+    expect(payload.kind).toBe('fynd');
+    expect(payload.payload.tx.to).toBe(ROUTER);
+    expect(payload.payload.tx.value).toBe(0n);
+    expect(payload.payload.tx.data).toBe('0x');
+  });
+
+  it('builds transaction with calldata from quote.transaction', async () => {
+    const provider = makeMockProvider();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    seedInfo(client);
+    const quote = {
+      ...makeDummyQuote(),
+      transaction: {
+        to: '0x2222222222222222222222222222222222222222' as Address,
+        value: 42n,
+        data: '0xdeadbeef' as Hex,
+      },
+    };
+    const payload = await client.swapPayload(quote);
+    expect(payload.payload.tx.to).toBe('0x2222222222222222222222222222222222222222');
+    expect(payload.payload.tx.value).toBe(42n);
+    expect(payload.payload.tx.data).toBe('0xdeadbeef');
+  });
+
+  it('throws CONFIG error when quote has no transaction', async () => {
+    const provider = makeMockProvider();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    seedInfo(client);
+    const { transaction: _, ...quoteWithoutTx } = makeDummyQuote();
+    await expect(client.swapPayload(quoteWithoutTx)).rejects.toThrow(FyndError);
+    try {
+      await client.swapPayload(quoteWithoutTx);
+    } catch (e) {
+      expect(e instanceof FyndError && e.code).toBe('CONFIG');
+    }
+  });
+
+  it('uses hints.sender over options.sender', async () => {
+    const provider = makeMockProvider();
+    const altSender = '0x9999999999999999999999999999999999999999' as Address;
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    seedInfo(client);
+    const quote = makeDummyQuote();
+    await client.swapPayload(quote, { sender: altSender });
+    expect(provider.getTransactionCount).toHaveBeenCalledWith({ address: altSender });
+  });
+
+  it('uses hints.nonce without calling getTransactionCount', async () => {
+    const provider = makeMockProvider();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    seedInfo(client);
+    const quote = makeDummyQuote();
+    const payload = await client.swapPayload(quote, { nonce: 99 });
+    expect(payload.payload.tx.nonce).toBe(99);
+    expect(provider.getTransactionCount).not.toHaveBeenCalled();
+  });
+
+  it('uses hints.maxFeePerGas without calling estimateFeesPerGas', async () => {
+    const provider = makeMockProvider();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    seedInfo(client);
+    const quote = makeDummyQuote();
+    const payload = await client.swapPayload(quote, {
+      maxFeePerGas:         50n,
+      maxPriorityFeePerGas: 5n,
+    });
+    expect(payload.payload.tx.maxFeePerGas).toBe(50n);
+    expect(payload.payload.tx.maxPriorityFeePerGas).toBe(5n);
+    expect(provider.estimateFeesPerGas).not.toHaveBeenCalled();
+  });
+
+  it('uses hints.gasLimit over quote.gasEstimate', async () => {
+    const provider = makeMockProvider();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    seedInfo(client);
+    const quote = makeDummyQuote(); // gasEstimate = 150000n
+    const payload = await client.swapPayload(quote, { gasLimit: 200000n });
+    expect(payload.payload.tx.gas).toBe(200000n);
+  });
+
+  it('calls provider.call when hints.simulate is true', async () => {
+    const provider = makeMockProvider();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    seedInfo(client);
+    const quote = makeDummyQuote();
+    await client.swapPayload(quote, { simulate: true });
+    expect(provider.call).toHaveBeenCalledOnce();
+  });
+
+  it('throws SIMULATE_FAILED when provider.call throws during simulation', async () => {
+    const provider = makeMockProvider();
+    provider.call.mockRejectedValueOnce(new Error('execution reverted'));
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+    seedInfo(client);
+    const quote = makeDummyQuote();
+    await expect(client.swapPayload(quote, { simulate: true })).rejects.toThrow(FyndError);
+    try {
+      await client.swapPayload(quote, { simulate: true });
+    } catch (e) {
+      expect(e instanceof FyndError && e.code).toBe('SIMULATE_FAILED');
+    }
+  });
+});
+
+describe('FyndClient.executeSwap — standard path', () => {
+  it('calls sendRawTransaction and returns receipt with settle()', async () => {
+    const provider = makeMockProvider();
+    provider.sendRawTransaction.mockResolvedValueOnce('0xhash123' as Hex);
+    const receipt: MinimalReceipt = {
+      transactionHash: '0xhash123' as Hex,
+      gasUsed:         150000n,
+      effectiveGasPrice: 20n,
+      logs:            [],
+    };
+    provider.getTransactionReceipt.mockResolvedValueOnce(receipt);
+
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+
+    const signedOrder = makeSignedSwap(makeDummyQuote());
+    const executionReceipt = await client.executeSwap(signedOrder);
+    expect(provider.sendRawTransaction).toHaveBeenCalledOnce();
+
+    const settled = await executionReceipt.settle();
+    expect(settled.txHash).toBe('0xhash123');
+    expect(settled.gasCost).toBe(3000000n); // 150000 * 20
+  });
+
+  it('throws CONFIG when provider not set', async () => {
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+    });
+    const signedOrder = makeSignedSwap(makeDummyQuote());
+    await expect(client.executeSwap(signedOrder)).rejects.toThrow(FyndError);
+  });
+
+  it('settle() throws SETTLE_TIMEOUT when receipt never arrives', async () => {
+    const provider = makeMockProvider();
+    provider.sendRawTransaction.mockResolvedValueOnce('0xhash123' as Hex);
+    provider.getTransactionReceipt.mockResolvedValue(null);
+
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+
+    const signedOrder = makeSignedSwap(makeDummyQuote());
+    const executionReceipt = await client.executeSwap(signedOrder);
+    await expect(executionReceipt.settle({ timeoutMs: 0 })).rejects.toThrow(
+      expect.objectContaining({ code: 'SETTLE_TIMEOUT' }),
+    );
+  });
+});
+
+describe('FyndClient.executeSwap — dry-run path', () => {
+  it('calls provider.call and estimateGas, not sendRawTransaction', async () => {
+    const provider = makeMockProvider();
+    // Return 32 bytes of return data (1000 in big-endian uint256)
+    // 64 hex chars total: 61 zeros + '3e8' (0x3e8 = 1000)
+    const returnHex = ('0x' + '0'.repeat(61) + '3e8') as Hex;  // 0x3e8 = 1000
+    provider.call.mockResolvedValueOnce({ data: returnHex as Hex });
+    provider.estimateGas.mockResolvedValueOnce(100000n);
+
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+
+    const signedOrder = makeSignedSwap(makeDummyQuote());
+    const executionReceipt = await client.executeSwap(signedOrder, { dryRun: true });
+    expect(provider.sendRawTransaction).not.toHaveBeenCalled();
+    expect(provider.call).toHaveBeenCalledOnce();
+    expect(provider.estimateGas).toHaveBeenCalledOnce();
+
+    const settled = await executionReceipt.settle();
+    expect(settled.txHash).toBeUndefined();
+    expect(settled.gasCost).toBe(100000n * 20000000000n); // gasUsed * maxFeePerGas
+  });
+
+  it('settle() resolves immediately for dry-run', async () => {
+    const provider = makeMockProvider();
+    provider.call.mockResolvedValueOnce({ data: undefined });
+    provider.estimateGas.mockResolvedValueOnce(50000n);
+
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+
+    const signedOrder = makeSignedSwap(makeDummyQuote());
+    const executionReceipt = await client.executeSwap(signedOrder, { dryRun: true });
+    // Should resolve without any polling
+    const settled = await executionReceipt.settle();
+    expect(provider.getTransactionReceipt).not.toHaveBeenCalled();
+    expect(settled.settledAmount).toBeUndefined();
+  });
+
+  it('settledAmount decoded from 32-byte return data', async () => {
+    const provider = makeMockProvider();
+    // 32 bytes = 64 hex chars: represent value 0x123 = 291
+    // Pad to exactly 64 hex chars: 61 zeros + '123'
+    const returnHex = ('0x' + '0'.repeat(61) + '123') as Hex;
+    provider.call.mockResolvedValueOnce({ data: returnHex });
+    provider.estimateGas.mockResolvedValueOnce(50000n);
+
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+
+    const signedOrder = makeSignedSwap(makeDummyQuote());
+    const receipt = await client.executeSwap(signedOrder, { dryRun: true });
+    const settled = await receipt.settle();
+    expect(settled.settledAmount).toBe(0x123n);
+  });
+
+  it('settledAmount is undefined when return data is absent', async () => {
+    const provider = makeMockProvider();
+    provider.call.mockResolvedValueOnce({ data: undefined });
+    provider.estimateGas.mockResolvedValueOnce(50000n);
+
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+
+    const signedOrder = makeSignedSwap(makeDummyQuote());
+    const receipt = await client.executeSwap(signedOrder, { dryRun: true });
+    const settled = await receipt.settle();
+    expect(settled.settledAmount).toBeUndefined();
+  });
+
+  it('throws SIMULATE_FAILED when provider.call throws during dry-run', async () => {
+    const provider = makeMockProvider();
+    provider.call.mockRejectedValueOnce(new Error('execution reverted'));
+
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+
+    const signedOrder = makeSignedSwap(makeDummyQuote());
+    await expect(client.executeSwap(signedOrder, { dryRun: true })).rejects.toThrow(FyndError);
+    try {
+      await client.executeSwap(signedOrder, { dryRun: true });
+    } catch (e) {
+      expect(e instanceof FyndError && e.code).toBe('SIMULATE_FAILED');
+    }
+  });
+
+  it('uses maxFeePerGas for dry-run gasCost calculation', async () => {
+    const provider = makeMockProvider();
+    provider.call.mockResolvedValueOnce({ data: undefined });
+    provider.estimateGas.mockResolvedValueOnce(200000n);
+
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+
+    const quote = makeDummyQuote();
+    // maxFeePerGas is set in swapPayload; here we create a signed order directly
+    const signedOrder = makeSignedSwap(quote, { maxFeePerGas: 30n });
+    const receipt = await client.executeSwap(signedOrder, { dryRun: true });
+    const settled = await receipt.settle();
+    expect(settled.gasCost).toBe(200000n * 30n); // gasUsed * maxFeePerGas
+  });
+});
+
+// Transfer log decoding — tested indirectly via execute settle()
+describe('Transfer log decoding via settle()', () => {
+  const ERC20_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' as Hex;
+  const ERC6909_TOPIC = '0x1b3d7edb2e9c0b0e7c525b20aaaef0f5940d2ed71663c7d39266ecafac728859' as Hex;
+
+  function padAddress(addr: string): Hex {
+    return `0x${'0'.repeat(24)}${addr.slice(2)}` as Hex;
+  }
+
+  function makeReceiptWithLogs(logs: MinimalReceipt['logs']): MinimalReceipt {
+    return {
+      transactionHash: '0xtxhash' as Hex,
+      gasUsed:         100000n,
+      effectiveGasPrice: 10n,
+      logs,
+    };
+  }
+
+  async function executeAndSettle(
+    quote: ReturnType<typeof makeDummyQuote>,
+    receipt: MinimalReceipt,
+  ) {
+    const provider = makeMockProvider();
+    provider.sendRawTransaction.mockResolvedValueOnce('0xtxhash' as Hex);
+    provider.getTransactionReceipt.mockResolvedValueOnce(receipt);
+
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      sender:  SENDER,
+      provider,
+    });
+
+    const signedOrder = makeSignedSwap(quote);
+    const executionReceipt = await client.executeSwap(signedOrder);
+    return executionReceipt.settle();
+  }
+
+  it('ERC-20: matching log returns correct amount', async () => {
+    const amount = 3500000000n;
+    const amountHex = amount.toString(16).padStart(64, '0');
+    const log = {
+      address: TOKEN_OUT,
+      topics: [ERC20_TOPIC, padAddress(SENDER), padAddress(SENDER)] as Hex[],
+      data:   `0x${amountHex}` as Hex,
+    };
+    const settled = await executeAndSettle(makeDummyQuote(), makeReceiptWithLogs([log]));
+    expect(settled.settledAmount).toBe(amount);
+  });
+
+  it('ERC-20: wrong token address returns undefined', async () => {
+    const wrongToken = '0x0000000000000000000000000000000000000001' as Address;
+    const log = {
+      address: wrongToken,
+      topics: [ERC20_TOPIC, padAddress(SENDER), padAddress(SENDER)] as Hex[],
+      data:   `0x${'0'.repeat(63)}1` as Hex,
+    };
+    const settled = await executeAndSettle(makeDummyQuote(), makeReceiptWithLogs([log]));
+    expect(settled.settledAmount).toBeUndefined();
+  });
+
+  it('ERC-20: wrong receiver returns undefined', async () => {
+    const wrongReceiver = '0x9999999999999999999999999999999999999999' as Address;
+    const log = {
+      address: TOKEN_OUT,
+      topics: [ERC20_TOPIC, padAddress(SENDER), padAddress(wrongReceiver)] as Hex[],
+      data:   `0x${'0'.repeat(63)}1` as Hex,
+    };
+    const settled = await executeAndSettle(makeDummyQuote(), makeReceiptWithLogs([log]));
+    expect(settled.settledAmount).toBeUndefined();
+  });
+
+  it('ERC-6909: matching log returns correct amount at bytes 32..64', async () => {
+    const amount = 12345n;
+    const amountHex = amount.toString(16).padStart(64, '0');
+    // data: caller[32 bytes] + amount[32 bytes]
+    const callerHex = '0'.repeat(64);
+    const log = {
+      address: TOKEN_OUT,
+      topics: [ERC6909_TOPIC, padAddress(SENDER), padAddress(SENDER)] as Hex[],
+      data:   `0x${callerHex}${amountHex}` as Hex,
+    };
+    const settled = await executeAndSettle(makeDummyQuote(), makeReceiptWithLogs([log]));
+    expect(settled.settledAmount).toBe(amount);
+  });
+
+  it('multiple matching logs: amounts are summed', async () => {
+    const amountHex1 = (1000n).toString(16).padStart(64, '0');
+    const amountHex2 = (2000n).toString(16).padStart(64, '0');
+    const logs = [
+      {
+        address: TOKEN_OUT,
+        topics: [ERC20_TOPIC, padAddress(SENDER), padAddress(SENDER)] as Hex[],
+        data:   `0x${amountHex1}` as Hex,
+      },
+      {
+        address: TOKEN_OUT,
+        topics: [ERC20_TOPIC, padAddress(SENDER), padAddress(SENDER)] as Hex[],
+        data:   `0x${amountHex2}` as Hex,
+      },
+    ];
+    const settled = await executeAndSettle(makeDummyQuote(), makeReceiptWithLogs(logs));
+    expect(settled.settledAmount).toBe(3000n);
+  });
+
+  it('empty logs returns undefined', async () => {
+    const settled = await executeAndSettle(makeDummyQuote(), makeReceiptWithLogs([]));
+    expect(settled.settledAmount).toBeUndefined();
+  });
+});
+
+const wireInstanceInfo = {
+  router_address:  ROUTER,
+  permit2_address: PERMIT2,
+  chain_id:        1,
+};
+
+function makeInfoClient(opts?: Partial<FyndClientOptions>): FyndClient {
+  return makeClientWithHttpMock(
+    { status: 200, data: wireSolution },
+    undefined,
+    opts,
+    { status: 200, data: wireInstanceInfo },
+  );
+}
+
+describe('FyndClient.info', () => {
+  it('fetches and returns InstanceInfo', async () => {
+    const client = makeInfoClient();
+    const info = await client.info();
+    expect(info.routerAddress).toBe(ROUTER);
+    expect(info.permit2Address).toBe(PERMIT2);
+    expect(info.chainId).toBe(1);
+  });
+
+  it('caches: second call does not make an extra HTTP request', async () => {
+    const client = makeInfoClient();
+    await client.info();
+    await client.info();
+    // Access internal http mock
+    const httpMock = (client as any).http as { GET: ReturnType<typeof vi.fn> };
+    expect(httpMock.GET).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates errors and resets cache on failure', async () => {
+    const client = makeClientWithHttpMock(
+      { status: 200, data: wireSolution },
+      undefined,
+      undefined,
+      { status: 500, data: { code: 'INTERNAL', error: 'server error' } },
+    );
+    await expect(client.info()).rejects.toThrow(FyndError);
+    // After failure, infoPromise should be reset so next call retries
+    const httpMock = (client as any).http as { GET: ReturnType<typeof vi.fn> };
+    httpMock.GET.mockImplementationOnce((path: string) => {
+      if (path === '/v1/info') {
+        return Promise.resolve({ data: wireInstanceInfo, error: undefined, response: {} });
+      }
+      return Promise.resolve({ data: undefined, error: undefined, response: {} });
+    });
+    const info = await client.info();
+    expect(info.routerAddress).toBe(ROUTER);
+  });
+
+  it('returns a null routerAddress on a quote-only chain', async () => {
+    const client = makeClientWithHttpMock(
+      { status: 200, data: wireSolution },
+      undefined,
+      undefined,
+      { status: 200, data: { ...wireInstanceInfo, router_address: null } },
+    );
+    const info = await client.info();
+    expect(info.routerAddress).toBeNull();
+    expect(info.permit2Address).toBe(PERMIT2);
+  });
+});
+
+describe('FyndClient.approval', () => {
+  it('builds approve calldata with correct 4-byte selector', async () => {
+    const provider = makeMockProvider();
+    const client = makeInfoClient({ provider });
+    const payload = await client.approval({ token: TOKEN_IN_ADDR, amount: 1000n });
+    expect(payload).not.toBeNull();
+    // approve(address,uint256) selector = 0x095ea7b3
+    expect(payload!.tx.data.startsWith('0x095ea7b3')).toBe(true);
+  });
+
+  it('rejects transfer_from approval when routerAddress is null', async () => {
+    const provider = makeMockProvider();
+    const client = makeClientWithHttpMock(
+      { status: 200, data: wireSolution },
+      undefined,
+      { provider },
+      { status: 200, data: { ...wireInstanceInfo, router_address: null } },
+    );
+    await expect(
+      client.approval({ token: TOKEN_IN_ADDR, amount: 1000n }),
+    ).rejects.toThrow(FyndError);
+  });
+
+  it('sets spender to routerAddress from info', async () => {
+    const provider = makeMockProvider();
+    const client = makeInfoClient({ provider });
+    const payload = await client.approval({ token: TOKEN_IN_ADDR, amount: 500n });
+    expect(payload).not.toBeNull();
+    expect(payload!.spender).toBe(ROUTER);
+    expect(payload!.token).toBe(TOKEN_IN_ADDR);
+    expect(payload!.amount).toBe(500n);
+  });
+
+  it('sets spender to permit2Address when transferType is transfer_from_permit2', async () => {
+    const provider = makeMockProvider();
+    const client = makeInfoClient({ provider });
+    const payload = await client.approval({
+      token: TOKEN_IN_ADDR, amount: 500n, transferType: 'transfer_from_permit2',
+    });
+    expect(payload).not.toBeNull();
+    expect(payload!.spender).toBe(PERMIT2);
+  });
+
+  it('returns null immediately when transferType is none', async () => {
+    const provider = makeMockProvider();
+    const client = makeInfoClient({ provider });
+    const result = await client.approval({ token: TOKEN_IN_ADDR, amount: 500n, transferType: 'none' });
+    expect(result).toBeNull();
+  });
+
+  it('defaults gasLimit to 65_000n', async () => {
+    const provider = makeMockProvider();
+    const client = makeInfoClient({ provider });
+    const payload = await client.approval({ token: TOKEN_IN_ADDR, amount: 1000n });
+    expect(payload).not.toBeNull();
+    expect(payload!.tx.gas).toBe(65_000n);
+  });
+
+  it('respects gasLimit override', async () => {
+    const provider = makeMockProvider();
+    const client = makeInfoClient({ provider });
+    const payload = await client.approval({ token: TOKEN_IN_ADDR, amount: 1000n }, { gasLimit: 80_000n });
+    expect(payload).not.toBeNull();
+    expect(payload!.tx.gas).toBe(80_000n);
+  });
+
+  it('throws CONFIG when provider is not set', async () => {
+    const client = makeInfoClient({ provider: undefined });
+    await expect(client.approval({ token: TOKEN_IN_ADDR, amount: 1000n })).rejects.toThrow(
+      expect.objectContaining({ code: 'CONFIG' }),
+    );
+  });
+
+  it('throws CONFIG when sender is not set', async () => {
+    const provider = makeMockProvider();
+    const client = makeInfoClient({ provider, sender: undefined });
+    await expect(client.approval({ token: TOKEN_IN_ADDR, amount: 1000n })).rejects.toThrow(
+      expect.objectContaining({ code: 'CONFIG' }),
+    );
+  });
+
+  it('checkAllowance: returns payload when allowance is insufficient', async () => {
+    const provider = makeMockProvider();
+    provider.readAllowance.mockResolvedValueOnce(100n);
+    const client = makeInfoClient({ provider });
+    const result = await client.approval({ token: TOKEN_IN_ADDR, amount: 1000n, checkAllowance: true });
+    expect(result).not.toBeNull();
+  });
+
+  it('checkAllowance: returns null when allowance is sufficient', async () => {
+    const provider = makeMockProvider();
+    provider.readAllowance.mockResolvedValueOnce(5000n);
+    const client = makeInfoClient({ provider });
+    const result = await client.approval({ token: TOKEN_IN_ADDR, amount: 1000n, checkAllowance: true });
+    expect(result).toBeNull();
+  });
+
+  it('checkAllowance: throws CONFIG when provider.readAllowance is absent', async () => {
+    const baseProvider = makeMockProvider();
+    const { readAllowance: _, ...providerWithoutAllowance } = baseProvider;
+    const client = makeInfoClient({ provider: providerWithoutAllowance });
+    await expect(
+      client.approval({ token: TOKEN_IN_ADDR, amount: 1000n, checkAllowance: true }),
+    ).rejects.toThrow(expect.objectContaining({ code: 'CONFIG' }));
+  });
+});
+
+describe('FyndClient.executeApproval', () => {
+  it('broadcasts and returns TxReceipt with gasCost', async () => {
+    const provider = makeMockProvider();
+    provider.sendRawTransaction.mockResolvedValueOnce('0xapprovalhash' as Hex);
+    const receipt: MinimalReceipt = {
+      transactionHash: '0xapprovalhash' as Hex,
+      gasUsed:         50000n,
+      effectiveGasPrice: 10n,
+      logs:            [],
+    };
+    provider.getTransactionReceipt.mockResolvedValueOnce(receipt);
+
+    const client = makeInfoClient({ provider });
+    const approvalPayload = await client.approval({ token: TOKEN_IN_ADDR, amount: 1000n });
+    const signedApproval = {
+      tx:        approvalPayload.tx,
+      signature: `0x${'ab'.repeat(32)}${'cd'.repeat(32)}00` as Hex,
+    };
+
+    const txReceipt = await client.executeApproval(signedApproval);
+    expect(txReceipt.txHash).toBe('0xapprovalhash');
+    expect(txReceipt.gasCost).toBe(500000n); // 50000 * 10
+  });
+
+  it('throws CONFIG when provider is not set', async () => {
+    const client = makeInfoClient({ provider: undefined });
+    const signedApproval = {
+      tx: {
+        chainId: 1, nonce: 0, maxFeePerGas: 20n, maxPriorityFeePerGas: 2n,
+        gas: 65_000n, to: TOKEN_IN_ADDR, value: 0n, data: '0x' as Hex,
+      },
+      signature: `0x${'ab'.repeat(32)}${'cd'.repeat(32)}00` as Hex,
+    };
+    await expect(client.executeApproval(signedApproval)).rejects.toThrow(
+      expect.objectContaining({ code: 'CONFIG' }),
+    );
+  });
+});
+
+// ---- helpers ----
+
+function makeDummyQuote(overrides?: Partial<{ gasEstimate: bigint }>) {
+  return {
+    orderId:     'test-order',
+    status:      'success' as const,
+    backend:     'fynd' as const,
+    amountIn:    1000n,
+    amountOut:   3500n,
+    gasEstimate: overrides?.gasEstimate ?? 150000n,
+    block: { hash: '0xabc', number: 100, timestamp: 1000 },
+    tokenOut: TOKEN_OUT,
+    receiver: SENDER,
+    transaction: {
+      to: ROUTER,
+      value: 0n,
+      data: '0x' as Hex,
+    },
+  };
+}
+
+function makeSignedSwap(
+  quote: ReturnType<typeof makeDummyQuote>,
+  txOverrides?: { maxFeePerGas?: bigint },
+) {
+  const tx = {
+    chainId:              1,
+    nonce:                0,
+    maxFeePerGas:         txOverrides?.maxFeePerGas ?? 20000000000n,
+    maxPriorityFeePerGas: 2000000000n,
+    gas:                  quote.gasEstimate,
+    to:                   ROUTER,
+    value:                0n,
+    data:                 '0x' as Hex,
+  };
+  const payload = { kind: 'fynd' as const, payload: { quote, tx } };
+  // A valid 65-byte hex signature (r[32]+s[32]+v[1])
+  const sig = `0x${'ab'.repeat(32)}${'cd'.repeat(32)}00` as `0x${string}`;
+  return { payload, signature: sig };
+}
+
+// ---------------------------------------------------------------------------
+// Hosted gateway: API key + per-chain routing
+//
+// These go through the real openapi-fetch transport (unlike makeClientWithHttpMock,
+// which replaces the whole http client) so that headers and URL rewriting are observable.
+// ---------------------------------------------------------------------------
+
+describe('hosted gateway auth and routing', () => {
+  const WIRE_HEALTH = { healthy: true, last_update_ms: 1, num_solver_pools: 2 };
+
+  /** Stub globalThis.fetch. Must run before the client is constructed. */
+  function stubFetch(body: unknown = WIRE_HEALTH) {
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(
+      JSON.stringify(body),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )));
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  /** The Request that openapi-fetch handed to fetch. */
+  function sentRequest(fetchMock: ReturnType<typeof stubFetch>): Request {
+    const [request] = fetchMock.mock.calls[0] as unknown as [Request];
+    return request;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('sends the api key as the raw Authorization header', async () => {
+    const fetchMock = stubFetch();
+    const client = new FyndClient({ baseUrl: 'http://localhost:8080', apiKey: 'secret-key' });
+
+    await client.health();
+
+    expect(sentRequest(fetchMock).headers.get('authorization')).toBe('secret-key');
+  });
+
+  it('routes to the chain-scoped path when chain is set', async () => {
+    const fetchMock = stubFetch();
+    const client = new FyndClient({ baseUrl: 'http://localhost:8080', chain: 'base' });
+
+    await client.health();
+
+    expect(new URL(sentRequest(fetchMock).url).pathname).toBe('/v1/base/health');
+  });
+
+  it('rewrites the quote path too', async () => {
+    const fetchMock = stubFetch(wireSolution);
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      chain:   'unichain',
+      apiKey:  'secret-key',
+      sender:  SENDER,
+    });
+
+    await client.quote({
+      order: { tokenIn: TOKEN_IN, tokenOut: TOKEN_OUT, amount: 1000n, side: 'sell', sender: SENDER },
+    });
+
+    const request = sentRequest(fetchMock);
+    expect(new URL(request.url).pathname).toBe('/v1/unichain/quote');
+    expect(request.headers.get('authorization')).toBe('secret-key');
+  });
+
+  it('keeps legacy paths and sends no auth header when neither option is set', async () => {
+    const fetchMock = stubFetch();
+    const client = new FyndClient({ baseUrl: 'http://localhost:8080' });
+
+    await client.health();
+
+    const request = sentRequest(fetchMock);
+    expect(new URL(request.url).pathname).toBe('/v1/health');
+    expect(request.headers.get('authorization')).toBeNull();
+  });
+
+  it('preserves a base URL path prefix when inserting the chain segment', async () => {
+    const fetchMock = stubFetch();
+    const client = new FyndClient({ baseUrl: 'http://localhost:8080/gateway', chain: 'base' });
+
+    await client.health();
+
+    expect(new URL(sentRequest(fetchMock).url).pathname).toBe('/gateway/v1/base/health');
+  });
+
+  it('passes through arbitrary headers', async () => {
+    const fetchMock = stubFetch();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      headers: { 'X-Trace-Id': 'abc123' },
+    });
+
+    await client.health();
+
+    expect(sentRequest(fetchMock).headers.get('x-trace-id')).toBe('abc123');
+  });
+
+  it('lets apiKey win over an Authorization header passed via headers', async () => {
+    const fetchMock = stubFetch();
+    const client = new FyndClient({
+      baseUrl: 'http://localhost:8080',
+      apiKey:  'secret-key',
+      headers: { Authorization: 'Bearer stale' },
+    });
+
+    await client.health();
+
+    expect(sentRequest(fetchMock).headers.get('authorization')).toBe('secret-key');
+  });
+});

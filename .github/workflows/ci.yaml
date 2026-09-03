@@ -1,0 +1,188 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  compile_and_test:
+    name: Compile & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+      - name: Setup toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install latest nextest release
+        uses: taiki-e/install-action@nextest
+      - name: Compile
+        run: >-
+          cargo nextest run --workspace --all-targets --all-features --no-run --locked
+          -E 'not binary(algorithm_bench) and not binary(profile)'
+      - name: Test
+        run: >-
+          cargo nextest run --workspace --all-targets --all-features
+          -E 'not binary(algorithm_bench) and not binary(profile)'
+
+  lint:
+    name: Code Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-06-28
+          components: rustfmt, clippy
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Clippy
+        run: cargo +${{steps.toolchain.outputs.name}} clippy --workspace --all-targets --all-features
+
+      - name: Rustfmt
+        run: cargo +${{steps.toolchain.outputs.name}} fmt --all --check
+
+  openapi_drift:
+    name: OpenAPI Spec Drift Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Use PR head so we build and compare the branch’s code and openapi.json, not base
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Setup toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check OpenAPI spec is up to date
+        run: |
+          # Strip info.version before diffing: the release bot bumps Cargo.toml and commits it
+          # to main, which changes the generated spec's version field. Regenerating and committing
+          # openapi.json as part of the release would require a second post-release commit, so we
+          # accept version drift here and only check that the API surface itself hasn't changed.
+          cargo run --locked --features fynd-rpc/experimental -- openapi \
+            | jq 'del(.info.version)' > /tmp/openapi.json
+          jq 'del(.info.version)' clients/openapi.json > /tmp/openapi_committed.json
+          if ! diff -q /tmp/openapi_committed.json /tmp/openapi.json > /dev/null 2>&1; then
+            echo "clients/openapi.json is out of date. Run './scripts/update-openapi.sh' and commit the changed files."
+            diff /tmp/openapi_committed.json /tmp/openapi.json
+            exit 1
+          fi
+
+  typescript_autogen_drift:
+    name: TypeScript Autogen Drift Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Generate fresh schema
+        run: npx --yes openapi-typescript@7.13.0 clients/openapi.json -o /tmp/schema.d.ts
+      - name: Check autogen schema is up to date
+        run: |
+          if ! diff -q clients/typescript/client/src/schema.d.ts /tmp/schema.d.ts > /dev/null 2>&1; then
+            echo "clients/typescript/client/src/schema.d.ts is out of date. Run './scripts/update-openapi.sh' and commit the changed files."
+            diff clients/typescript/client/src/schema.d.ts /tmp/schema.d.ts
+            exit 1
+          fi
+
+  docs_snippet_drift:
+    name: Check doc snippet drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check doc snippets
+        run: bash scripts/check-doc-snippets.sh
+
+  check_ts_client:
+    name: TypeScript client typecheck + lint + test
+    needs: typescript_autogen_drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1  # v4.2.0
+        with:
+          version: "10.30.3"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: clients/typescript/pnpm-lock.yaml
+      - run: pnpm --dir clients/typescript install --frozen-lockfile
+      - run: pnpm --dir clients/typescript --filter @kayibal/fynd-client run typecheck
+      - run: pnpm --dir clients/typescript --filter @kayibal/fynd-client run lint
+      - run: pnpm --dir clients/typescript --filter @kayibal/fynd-client run test
+
+  integration_tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [compile_and_test]
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+          lfs: true
+      - name: Setup toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: stable
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-on-failure: true
+      - name: Install latest nextest release
+        uses: taiki-e/install-action@2b15ad09ca0f06a76791407e35ab20f0b712d615  # nextest
+      - name: Run integration tests
+        run: cargo nextest run -p fynd-core --features test-utils --test integration
+
+  security_audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Run security audit
+        run: cargo audit

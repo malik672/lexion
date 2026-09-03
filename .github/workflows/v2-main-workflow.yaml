@@ -1,0 +1,31 @@
+name: Main workflow
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  tests-and-lints:
+    uses: ./.github/workflows/ci.yaml
+
+  dev-deployment:
+    needs: tests-and-lints
+    uses: ./.github/workflows/dev-deployment.yaml
+    permissions:
+      contents: read
+      packages: write
+    secrets:
+      APP_ID: ${{ secrets.APP_ID }}
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+
+  # Opens/updates a release PR on a normal push; on merge, creates a single tag + GitHub
+  # Release, which triggers release.yaml to publish crates + npm. Never commits to main.
+  # Auto-detects rust -> release-plz.
+  release:
+    uses: propeller-heads/ci-cd-templates/.github/workflows/release-v3.yaml@main
+    permissions:
+      contents: read
+    secrets:
+      app_id: ${{ secrets.APP_ID }}
+      app_private_key: ${{ secrets.APP_PRIVATE_KEY }}

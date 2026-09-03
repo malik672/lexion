@@ -1,0 +1,257 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
+
+use anyhow::{Context, Result};
+pub use fynd_core::PoolConfig;
+use serde::{Deserialize, Serialize};
+
+/// The default worker pools configuration embedded at compile time.
+///
+/// Used as a fallback when the default `worker_pools.toml` path is not found at runtime,
+/// so the binary works out-of-the-box without a config file (e.g. `cargo install`, Docker).
+///
+/// Keep in sync with the repo-root `worker_pools.toml` (the user-facing example config).
+/// Cannot use `include_str!` here because `cargo publish` verifies the crate in isolation,
+/// and the file lives outside the `fynd-rpc` package directory.
+const DEFAULT_WORKER_POOLS_TOML: &str = r#"
+[pools.bellman_ford_2_hops]
+algorithm = "bellman_ford"
+num_workers = 3
+task_queue_capacity = 1000
+max_hops = 2
+timeout_ms = 500
+
+# Example: an exclusive-access worker pool whose workers also route through exclusive components
+# to capture surplus above the committed public reference (see repo-root worker_pools.toml).
+# Worker pools with the key omitted default to "public_only": their workers drop exclusive
+# components. Only requests granted exclusive access are dispatched to such a worker pool, so
+# size num_workers to that share of flow.
+# [pools.exclusive_access]
+# algorithm = "bellman_ford"
+# num_workers = 3
+# max_hops = 2
+# timeout_ms = 500
+# liquidity_scope = "include_exclusive"
+
+# Example: a worker pool that never routes through a protocol system. An entry names a system
+# exactly ("uniswap_v2"), or a whole family when it ends with ":" — "propammfallback:" covers
+# every venue on the PropAMMRouter. Absent = no restriction, which is the default.
+# [pools.no_pamm]
+# algorithm = "bellman_ford"
+# num_workers = 3
+# max_hops = 2
+# timeout_ms = 500
+# exclude_protocols = ["propammfallback:"]
+"#;
+
+/// Worker pools configuration loaded from TOML file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerPoolsConfig {
+    /// Worker pool configurations (at least one worker pool must be specified)
+    pools: HashMap<String, PoolConfig>,
+}
+
+impl WorkerPoolsConfig {
+    /// Creates a new config from a map of worker pool configs.
+    pub fn new(pools: HashMap<String, PoolConfig>) -> Self {
+        Self { pools }
+    }
+
+    /// Returns the worker pool configurations.
+    pub fn pools(&self) -> &HashMap<String, PoolConfig> {
+        &self.pools
+    }
+
+    /// Consumes the config and returns the map of worker pool configs.
+    pub fn into_pools(self) -> HashMap<String, PoolConfig> {
+        self.pools
+    }
+
+    /// Returns the built-in default configuration embedded in the binary.
+    ///
+    /// This is the repo-root `worker_pools.toml` baked in at compile time.
+    pub fn builtin_default() -> Self {
+        toml::from_str(DEFAULT_WORKER_POOLS_TOML).expect("built-in worker_pools.toml is valid TOML")
+    }
+
+    /// Load worker pools configuration from a TOML file.
+    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        toml::from_str(&contents)
+            .with_context(|| format!("failed to parse config file {}", path.display()))
+    }
+}
+
+/// Blocklist configuration for excluding components from the Tycho stream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlocklistConfig {
+    /// Component IDs to exclude (e.g., component addresses with simulation issues).
+    #[serde(default)]
+    components: HashSet<String>,
+}
+
+impl BlocklistConfig {
+    /// Load blocklist configuration from a TOML file.
+    ///
+    /// The TOML file should have a `[blocklist]` section:
+    /// ```toml
+    /// [blocklist]
+    /// components = ["0x86d257cdb7bc9c0df10e84c8709697f92770b335"]
+    /// ```
+    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("failed to read blocklist config {}", path.display()))?;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            blocklist: BlocklistConfig,
+        }
+
+        let wrapper: Wrapper = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse blocklist config {}", path.display()))?;
+        Ok(wrapper.blocklist)
+    }
+
+    /// Consumes the struct and returns the underlying set of components.
+    pub fn into_components(self) -> HashSet<String> {
+        self.components
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fynd_core::LiquidityScope;
+
+    use super::*;
+
+    #[test]
+    fn test_builtin_default_does_not_panic() {
+        let config = WorkerPoolsConfig::builtin_default();
+        assert!(!config.pools().is_empty(), "built-in config must have at least one pool");
+    }
+
+    #[test]
+    fn test_pool_config_minimal_uses_defaults() {
+        let toml = r#"
+            [pools.basic]
+            algorithm = "most_liquid"
+        "#;
+        let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
+        let pool = &config.pools()["basic"];
+        assert_eq!(pool.algorithm(), "most_liquid");
+        assert_eq!(pool.num_workers(), num_cpus::get());
+        use fynd_core::solver::defaults as core_defaults;
+        assert_eq!(pool.task_queue_capacity(), core_defaults::POOL_TASK_QUEUE_CAPACITY);
+        assert_eq!(pool.min_hops(), core_defaults::POOL_MIN_HOPS);
+        assert_eq!(pool.max_hops(), core_defaults::POOL_MAX_HOPS);
+        assert_eq!(pool.timeout_ms(), core_defaults::POOL_TIMEOUT_MS);
+        assert_eq!(pool.max_routes(), None);
+    }
+
+    #[test]
+    fn test_pool_config_all_fields_explicit() {
+        let toml = r#"
+            [pools.custom]
+            algorithm = "most_liquid"
+            num_workers = 8
+            task_queue_capacity = 500
+            min_hops = 2
+            max_hops = 4
+            timeout_ms = 200
+            max_routes = 50
+            liquidity_scope = "include_exclusive"
+            exclude_protocols = ["propammfallback:", "uniswap_v2"]
+        "#;
+        let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
+        let pool = &config.pools()["custom"];
+        assert_eq!(pool.algorithm(), "most_liquid");
+        assert_eq!(pool.num_workers(), 8);
+        assert_eq!(pool.task_queue_capacity(), 500);
+        assert_eq!(pool.min_hops(), 2);
+        assert_eq!(pool.max_hops(), 4);
+        assert_eq!(pool.timeout_ms(), 200);
+        assert_eq!(pool.max_routes(), Some(50));
+        assert_eq!(pool.liquidity_scope(), Some(LiquidityScope::IncludeExclusive));
+        assert_eq!(
+            pool.exclude_protocols(),
+            Some(["propammfallback:".to_string(), "uniswap_v2".to_string()].as_slice())
+        );
+    }
+
+    /// A config written before `exclude_protocols` existed keeps parsing, and excludes nothing.
+    #[test]
+    fn test_pool_config_without_exclude_protocols() {
+        let toml = r#"
+            [pools.basic]
+            algorithm = "most_liquid"
+        "#;
+        let config: WorkerPoolsConfig = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.pools()["basic"].exclude_protocols(), None);
+    }
+}
+
+/// Default values for all `fynd-rpc` configuration parameters.
+pub mod defaults {
+    // Re-export shared defaults from fynd-core as the single source of truth.
+    pub use fynd_core::solver::defaults::{
+        GAS_REFRESH_INTERVAL, MIN_TOKEN_QUALITY, RECONNECT_DELAY, ROUTER_MIN_RESPONSES,
+        TRADED_N_DAYS_AGO, TVL_BUFFER_RATIO,
+    };
+
+    /// Default HTTP bind host (`"0.0.0.0"` — all interfaces).
+    pub const HTTP_HOST: &str = "0.0.0.0";
+    /// Default HTTP port (`3000`).
+    pub const HTTP_PORT: u16 = 3000;
+
+    /// Returns the default public JSON-RPC URL for the given chain, used when none is provided.
+    ///
+    /// Free, keyless, rate-limited endpoints for local development. Provide a dedicated
+    /// `--rpc-url` for production.
+    ///
+    /// Returns an error if the chain is not recognized.
+    pub fn default_rpc_url(chain: &str) -> Result<&str, String> {
+        match chain.to_lowercase().as_str() {
+            "ethereum" => Ok("https://eth.drpc.org"),
+            "base" => Ok("https://base.drpc.org"),
+            "unichain" => Ok("https://unichain.drpc.org"),
+            "bsc" => Ok("https://bsc-dataseed.bnbchain.org"),
+            "arbitrum" => Ok("https://arbitrum.drpc.org"),
+            "polygon" => Ok("https://polygon.drpc.org"),
+            other => Err(format!(
+                "no default RPC URL for chain '{}'. Please provide --rpc-url explicitly.",
+                other
+            )),
+        }
+    }
+
+    /// Worker-router timeout in milliseconds.
+    ///
+    /// Intentionally tighter than `FyndBuilder`'s generous 10 s standalone default; an HTTP
+    /// service must respond within its request deadline.
+    pub const WORKER_ROUTER_TIMEOUT_MS: u64 = 100;
+
+    /// Returns the default Tycho Fynd endpoint URL for the given chain.
+    ///
+    /// Returns an error if the chain is not recognized.
+    pub fn default_tycho_url(chain: &str) -> Result<&str, String> {
+        match chain.to_lowercase().as_str() {
+            "ethereum" => Ok("tycho-fynd-ethereum.propellerheads.xyz"),
+            "base" => Ok("tycho-fynd-base.propellerheads.xyz"),
+            "unichain" => Ok("tycho-fynd-unichain.propellerheads.xyz"),
+            "bsc" => Ok("tycho-bsc-beta.propellerheads.xyz"),
+            "arbitrum" => Ok("tycho-arbitrum-beta.propellerheads.xyz"),
+            "polygon" => Ok("tycho-polygon-beta.propellerheads.xyz"),
+            other => Err(format!(
+                "no default Tycho URL for chain '{}'. Please provide --tycho-url explicitly.",
+                other
+            )),
+        }
+    }
+}

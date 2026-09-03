@@ -1,0 +1,22 @@
+[package]
+name = "record-market"
+version.workspace = true
+edition = "2021"
+description = "Capture Tycho market state for integration testing"
+publish = false
+
+[dependencies]
+fynd-core = { workspace = true, features = ["test-utils"] }
+fynd-rpc.workspace = true
+fynd-test-fixtures.workspace = true
+tycho-simulation.workspace = true
+tokio = { workspace = true, features = ["full"] }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+tokio-stream.workspace = true
+num-bigint.workspace = true
+sha2.workspace = true

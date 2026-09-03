@@ -1,0 +1,22 @@
+[package]
+name = "fynd-test-fixtures"
+version.workspace = true
+edition = "2021"
+description = "Shared types for Fynd integration test recordings and expected outputs"
+publish = false
+
+[dependencies]
+fynd-core.workspace = true
+tycho-simulation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+num-bigint.workspace = true
+zstd = { workspace = true }
+anyhow.workspace = true
+toml.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

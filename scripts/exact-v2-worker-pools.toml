@@ -1,0 +1,7 @@
+[pools.exact_v2]
+algorithm = "path_frank_wolfe"
+num_workers = 1
+task_queue_capacity = 1000
+max_hops = 2
+timeout_ms = 5000
+max_routes = 100

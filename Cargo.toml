@@ -1,0 +1,205 @@
+[workspace.package]
+version = "0.99.22"
+
+[package]
+name = "fynd"
+version.workspace = true
+edition = "2021"
+description = "Hybrid exact-replay V2/V3 DEX router"
+license = "MIT"
+
+[features]
+default = ["metrics"]
+# Enables the Prometheus metrics exporter on a separate HTTP server.
+# Disable with `--no-default-features` to omit Actix-Web and the Prometheus
+# recorder from the binary (e.g. for embedded/minimal builds).
+metrics = ["dep:actix-web", "dep:metrics-exporter-prometheus", "dep:metrics"]
+
+[dependencies]
+fynd-rpc = { workspace = true }
+fynd-core = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# HTTP (for metrics server, gated behind the `metrics` feature)
+actix-web = { workspace = true, optional = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+
+# Serialization (for OpenAPI spec output)
+serde_json = { workspace = true }
+
+# OpenAPI (for ApiDoc::openapi() trait)
+utoipa = { workspace = true }
+
+# Tycho (for Chain type in CLI)
+tycho-simulation = { workspace = true }
+
+# Encoding/formatting for derive-connector-tokens
+chrono = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+reqwest = { workspace = true }
+alloy = { workspace = true, features = [
+    "providers",
+    "signer-local",
+    "rpc-types-eth",
+    "eip712",
+    "node-bindings",
+] }
+alloy-chains = "0.2"
+dialoguer = "0.11"
+serde = { workspace = true }
+serde_json = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+tycho-execution = { workspace = true }
+bytes = { workspace = true }
+fynd-client = { workspace = true }
+
+[workspace]
+members = [
+    "fynd-core",
+    "fynd-rpc",
+    "fynd-rpc-types",
+    "clients/rust",
+    "tools/benchmark",
+    "tools/common",
+    "tools/erc20-overrides",
+    "tools/fynd-swap-cli",
+    "tools/fynd-gas-audit",
+    "tools/hindsight",
+    "tools/record-market",
+    "test-fixtures",
+]
+resolver = "2"
+
+[workspace.dependencies]
+bytes = "1"
+alloy = { version = "1", features = [
+    "consensus",
+    "dyn-abi",
+    "eip712",
+    "network",
+    "providers",
+    "provider-http",
+    "rpc-types-eth",
+] }
+# HTTP
+# Default features minus "http2": that feature is the only thing pulling h2 ^0.3, which has no
+# patch for RUSTSEC-2026-0258. The server binds plain TCP with no TLS, so HTTP/2 was only ever
+# reachable via h2c prior knowledge. Re-enable once actix-http moves to h2 0.4.
+actix-web = { version = "4", default-features = false, features = [
+    "macros",
+    "compress-brotli",
+    "compress-gzip",
+    "compress-zstd",
+    "cookies",
+    "unicode",
+    "compat",
+    "ws",
+] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# Async
+tokio = { version = "1", features = ["full", "sync"] }
+futures = "0.3"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = { version = "3", features = ["std"] }
+toml = "0.8"
+
+# OpenAPI / Swagger UI
+utoipa = { version = "5", features = ["actix_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["actix-web"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
+tracing-opentelemetry = "0.28"
+tracing-actix-web = "0.7"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+metrics-util = "0.20"
+
+# Tycho
+tycho-execution = ">=0.372.0"
+tycho-simulation = ">=0.372.0"
+typetag = "0.2"
+
+# Compression
+zstd = "0.13"
+
+# Graph algorithms
+petgraph = "0.6"
+rustc-hash = "2.1"
+smallvec = "1.15"
+
+# Utilities
+num-bigint = { version = "0.4", features = ["serde"] }
+num-rational = "0.4"
+num-traits = "0.2"
+num_cpus = "1.16"
+lazy_static = { version = "1.5.0", default-features = false }
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio-stream = "0.1.18"
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+async-channel = "2.5.0"
+async-trait = "0.1"
+chrono = "0.4"
+itertools = "0.14.0"
+hex = "0.4"
+sha2 = "0.10"
+rand = "0.9"
+
+# Internal crates
+fynd-core = { path = "fynd-core", version = "0.99.22" }
+fynd-rpc = { path = "fynd-rpc", version = "0.99.22" }
+fynd-rpc-types = { path = "fynd-rpc-types", version = "0.99.22" }
+fynd-client = { path = "clients/rust", version = "0.99.22" }
+# Path-only: unpublished internal crates (release = false in release-plz.toml), so they must not
+# carry a version requirement -- release-plz bumps the workspace version and rewrites the
+# requirements for the crates it releases, but leaves these untouched. A stale requirement stops
+# matching the workspace version on the next minor bump and fails resolution.
+erc20-overrides = { path = "tools/erc20-overrides" }
+fynd-tools-common = { path = "tools/common" }
+fynd-test-fixtures = { path = "test-fixtures" }
+
+# Dev dependencies
+rstest = "0.18"
+tempfile = "3"
+
+# Release code with the symbols a profiler needs. Used by the benchmark
+[profile.profiling]
+inherits = "release"
+debug = true

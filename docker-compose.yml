@@ -1,0 +1,67 @@
+services:
+  fynd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+      - "9898:9898"
+    volumes:
+      - ./worker_pools.toml:/etc/fynd/worker_pools.toml:ro
+      - ./blocklist.toml:/etc/fynd/blocklist.toml:ro
+    environment:
+      - RPC_URL=${RPC_URL}
+      - TYCHO_API_KEY=${TYCHO_API_KEY:-}
+      - TYCHO_URL=${TYCHO_URL:-tycho-fynd-ethereum.propellerheads.xyz}
+      - WORKER_POOLS_CONFIG=/etc/fynd/worker_pools.toml
+      - BLOCKLIST_CONFIG=/etc/fynd/blocklist.toml
+      - RUST_LOG=fynd=info
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+    depends_on:
+      - tempo
+    command:
+      - "serve"
+      - "--chain"
+      - "${CHAIN:-Ethereum}"
+      - "--protocols"
+      - "${PROTOCOLS:-uniswap_v2,uniswap_v3,ekubo_v2,vm:curve,pancakeswap_v3,vm:maverick_v2,sushiswap_v2,erc4626,uniswap_v4_hooks,fluid_v1,pancakeswap_v2,vm:balancer_v2}"
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - fynd
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    ports:
+      - "3200:3200"
+      - "4317:4317"
+    volumes:
+      - ./monitoring/tempo.yml:/etc/tempo.yml:ro
+      - tempo-data:/var/tempo
+    command: ["-config.file=/etc/tempo.yml"]
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  tempo-data:

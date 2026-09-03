@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: fynd
+    static_configs:
+      - targets:
+          - fynd:9898

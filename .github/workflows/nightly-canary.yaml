@@ -1,0 +1,70 @@
+name: Nightly Canary
+
+# Records fresh live Tycho data and regenerates expected outputs from that same
+# recording before running the integration tests. The baselines are therefore
+# self-referential: this canary detects Tycho data-format changes, decode
+# failures, and replay-pipeline crashes — NOT solver quality regressions.
+# Quality is guarded by the committed baseline in the PR-triggered
+# integration_tests job in ci.yaml.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 06:00 UTC
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  live-canary:
+    name: Live Tycho Canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - name: Setup toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: stable
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-on-failure: true
+      - name: Install latest nextest release
+        uses: taiki-e/install-action@2b15ad09ca0f06a76791407e35ab20f0b712d615  # nextest
+
+      - name: Record fresh market state
+        run: |
+          cargo run -p record-market -- \
+            --tycho-url "$TYCHO_URL" \
+            --rpc-url "$RPC_URL" \
+            --tycho-api-key "$TYCHO_API_KEY" \
+            --duration-secs 120 \
+            --output-dir fynd-core/tests/fixtures
+        env:
+          TYCHO_URL: ${{ secrets.TYCHO_URL }}
+          RPC_URL: ${{ secrets.RPC_URL }}
+          TYCHO_API_KEY: ${{ secrets.TYCHO_API_KEY }}
+
+      - name: Run solver against live market
+        run: |
+          cargo nextest run -p fynd-core --features test-utils --test integration
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          echo "::error::Nightly canary failed — Tycho data format may have changed or the replay pipeline crashed"
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "::warning::SLACK_WEBHOOK_URL secret not set; skipping Slack notification"
+            exit 0
+          fi
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":red_circle: Nightly canary failed — Tycho data format may have changed or the replay pipeline crashed. <${RUN_URL}|View run>\"}" \
+            "$SLACK_WEBHOOK_URL"

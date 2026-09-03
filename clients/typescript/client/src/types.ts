@@ -1,0 +1,218 @@
+/** Outcome status of a quote request. Must stay in sync with the server schema. */
+export type SolutionStatus =
+  | 'success'
+  | 'no_route_found'
+  | 'insufficient_liquidity'
+  | 'timeout'
+  | 'not_ready'
+  | 'price_check_failed';
+
+/** Routing backend that produced a quote. */
+export type BackendKind = 'fynd' | 'turbine';
+
+/** EVM address as a hex string. */
+export type Address = `0x${string}`;
+/** Arbitrary hex-encoded bytes. */
+export type Hex = `0x${string}`;
+
+/** Order side. Currently only sell orders are supported. */
+export type OrderSide = 'sell';
+
+/** A swap order specifying input/output tokens, amount, and participants. */
+export interface Order {
+  /** Token to sell. */
+  tokenIn: Address;
+  /** Token to receive. */
+  tokenOut: Address;
+  /** Amount of `tokenIn` to sell (in token base units). */
+  amount: bigint;
+  side: OrderSide;
+  /** Address that holds the input tokens and sends the transaction. */
+  sender: Address;
+  /** Address that receives output tokens. Defaults to `sender` if omitted. */
+  receiver?: Address;
+}
+
+/** How the router pulls input tokens from the sender. */
+export type UserTransferType = 'transfer_from' | 'transfer_from_permit2' | 'use_vaults_funds' | 'none';
+
+/** Uniswap Permit2 allowance details for a single token. */
+export interface PermitDetails {
+  token: Address;
+  /** Maximum transferable amount (uint160). */
+  amount: bigint;
+  /** Unix timestamp after which the permit expires (uint48). */
+  expiration: bigint;
+  /** Permit2 nonce for this token/spender pair (uint48). */
+  nonce: bigint;
+}
+
+/** Uniswap Permit2 single-token permit, ready for EIP-712 signing. */
+export interface PermitSingle {
+  details: PermitDetails;
+  /** Address authorized to spend tokens via Permit2. */
+  spender: Address;
+  /** Unix timestamp after which the signature is invalid. */
+  sigDeadline: bigint;
+}
+
+/** Client fee configuration for the Tycho Router.
+ *
+ * When provided, the router charges a fee in basis points on the swap output.
+ * The `signature` must be an EIP-712 signature by the `receiver` over the
+ * `ClientFee` typed data — compute the hash with `clientFeeSigningHash`.
+ */
+export interface ClientFeeParams {
+  /** Fee in basis points (0–10,000). 100 = 1%. */
+  bps: number;
+  /** Address that receives the fee (also the required EIP-712 signer). */
+  receiver: Address;
+  /** Maximum subsidy from the client's vault balance. */
+  maxContribution: bigint;
+  /** Unix timestamp after which the signature is invalid. */
+  deadline: number;
+  /** 65-byte EIP-712 ECDSA signature by `receiver`. Set after signing. */
+  signature?: Hex;
+}
+
+/** Controls how the solver encodes the settlement transaction. */
+export interface EncodingOptions {
+  /** Maximum acceptable slippage as a fraction (e.g. 0.01 for 1%). */
+  slippage: number;
+  /** How tokens are transferred to the router. Defaults to `'transfer_from'`. */
+  transferType?: UserTransferType;
+  /** Permit2 permit data; required when `transferType` is `'transfer_from_permit2'`. */
+  permit?: PermitSingle;
+  /** 65-byte Permit2 signature over the permit; required with `permit`. */
+  permit2Signature?: Hex;
+  /** Client fee configuration. When absent, no fee is charged. */
+  clientFeeParams?: ClientFeeParams;
+}
+
+/** An encoded on-chain transaction returned by the solver. */
+export interface Transaction {
+  to: Address;
+  value: bigint;
+  data: Hex;
+}
+
+/** Optional parameters for a quote request. */
+export interface QuoteOptions {
+  /** Server-side solver timeout in milliseconds. */
+  timeoutMs?: number;
+  /** Minimum number of solver responses to wait for before returning. */
+  minResponses?: number;
+  /** Maximum gas the solution may consume. */
+  maxGas?: bigint;
+  /** Encoding options; when set, the response includes a ready-to-sign transaction. */
+  encodingOptions?: EncodingOptions;
+}
+
+/** Input parameters for {@link FyndClient.quote}. */
+export interface QuoteParams {
+  order: Order;
+  options?: QuoteOptions;
+}
+
+/** Block metadata at the time the quote was computed. */
+export interface BlockInfo {
+  number: number;
+  hash: string;
+  /** Unix timestamp of the block (seconds). */
+  timestamp: number;
+}
+
+/** A single component-level (liquidity pool) swap within a route. */
+export interface Swap {
+  /** Unique component identifier (wire name: `component_id`). */
+  componentId: string;
+  /** Protocol name (e.g. "uniswap_v3", "balancer_v2"). */
+  protocol: string;
+  tokenIn: Address;
+  tokenOut: Address;
+  amountIn: bigint;
+  amountOut: bigint;
+  gasEstimate: bigint;
+}
+
+/** An ordered sequence of swaps forming a complete routing path. */
+export interface Route {
+  swaps: Swap[];
+}
+
+/** Breakdown of fees applied to the swap output by the on-chain FeeCalculator. */
+export interface FeeBreakdown {
+  /** Router protocol fee (fee on output + router's share of client fee). */
+  routerFee: bigint;
+  /** Client's portion of the fee (after the router takes its share). */
+  clientFee: bigint;
+  /** Maximum slippage: (amountOut - routerFee - clientFee) * slippage. */
+  maxSlippage: bigint;
+  /** Minimum amount the user receives on-chain (the min_amount_out in the tx). */
+  minAmountReceived: bigint;
+}
+
+/** A solver quote containing the best route, amounts, and optional encoded transaction. */
+export interface Quote {
+  orderId: string;
+  status: SolutionStatus;
+  backend: BackendKind;
+  route?: Route;
+  amountIn: bigint;
+  amountOut: bigint;
+  gasEstimate: bigint;
+  /** Price impact in basis points (1 bp = 0.01%). */
+  priceImpactBps?: number;
+  /** Routing algorithm that produced this quote. */
+  algorithm?: string;
+  block: BlockInfo;
+  /** Output token address from the original order; used internally for settlement parsing. */
+  tokenOut: Address;
+  /** Receiver address; defaults to sender if not specified in the original order. */
+  receiver: Address;
+  /** Encoded transaction; present only when `encodingOptions` was set in the quote request. */
+  transaction?: Transaction;
+  /** Fee breakdown; present only when `encodingOptions` was set in the quote request. */
+  feeBreakdown?: FeeBreakdown;
+}
+
+/** Solver health status and readiness information. */
+export interface HealthStatus {
+  healthy: boolean;
+  /** Milliseconds since the last state update. */
+  lastUpdateMs: number;
+  /** Number of active solver worker pools. */
+  numSolverPools: number;
+  gasPriceAgeMs?: number;
+}
+
+/** Static metadata about a Fynd server instance. */
+export interface InstanceInfo {
+  /** Tycho Router contract address, or `null` on a quote-only chain. */
+  routerAddress: Address | null;
+  permit2Address: Address;
+  chainId: number;
+}
+
+/** Parameters for {@link FyndClient.approval}. */
+export interface ApprovalParams {
+  /** ERC-20 token to approve. */
+  token: Address;
+  /** Amount to approve (in token base units). */
+  amount: bigint;
+  /**
+   * Which contract to approve as spender.
+   *
+   * `'transfer_from'` → router contract (default).
+   * `'transfer_from_permit2'` → Permit2 contract.
+   * `'none'` → {@link FyndClient.approval} returns `null` immediately.
+   */
+  transferType?: UserTransferType;
+  /**
+   * When `true`, read on-chain allowance before building the transaction.
+   *
+   * If the allowance is already sufficient, {@link FyndClient.approval} returns `null`.
+   * Requires `provider.readAllowance` to be implemented.
+   */
+  checkAllowance?: boolean;
+}

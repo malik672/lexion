@@ -1,0 +1,74 @@
+[package]
+name = "fynd-core"
+version.workspace = true
+edition = "2021"
+description = "Core solving logic for Fynd DEX router"
+license = "MIT"
+readme = "README.md"
+# Integration tests and their Git LFS fixtures are dev-only; excluding them keeps
+# the published crate lean and stops `cargo publish` from dirty-checking the
+# LFS fixture (whose smudge state differs on the release runner).
+exclude = ["tests/"]
+
+[dependencies]
+tycho-simulation.workspace = true
+petgraph.workspace = true
+rustc-hash.workspace = true
+smallvec.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+num_cpus.workspace = true
+async-channel.workspace = true
+async-trait.workspace = true
+itertools.workspace = true
+uuid.workspace = true
+rand.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+typetag.workspace = true
+tycho-execution.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+alloy = { workspace = true, features = ["sol-types", "signer-local"] }
+
+[features]
+test-utils = []
+# Per-pool simulation metering: counts and times every `get_amount_out` a solve makes, splits it
+# by protocol and by solve pass, and reports it. Off by default — measuring a swap costs two clock
+# reads on the hottest path in the solver. With it off, solving calls the panic guard directly.
+swap-metrics = []
+# Block-step-controller build path: lets a caller release buffered blocks one at
+# a time (deterministic stepping). Used by the hindsight monitor; the API is not
+# yet stable, so it is opt-in.
+experimental = []
+
+[dev-dependencies]
+clap.workspace = true
+rstest.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+fynd-test-fixtures.workspace = true
+tracing-subscriber.workspace = true
+metrics-util.workspace = true
+
+# Offline algorithm comparison. `harness = false` because this is a report generator with its own
+# CLI, not a set of timed micro-benchmarks; `cargo bench` gives it an optimised build.
+[[bench]]
+name = "algorithm_bench"
+harness = false
+required-features = ["test-utils"]
+
+# Single algorithm, single thread, no output files -- the one to run under a profiler.
+[[bench]]
+name = "profile"
+harness = false
+required-features = ["test-utils"]
