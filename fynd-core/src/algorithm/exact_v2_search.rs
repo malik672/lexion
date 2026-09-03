@@ -39,6 +39,10 @@ fn symbolic_cut_census_enabled() -> bool {
     std::env::var_os("FYND_SYMBOLIC_ALLOCATION_CENSUS").is_some()
 }
 
+fn concavity_audit_enabled() -> bool {
+    std::env::var_os("FYND_CONCAVITY_AUDIT").is_some()
+}
+
 struct PathSearch<'a> {
     ctx: &'a BellmanFordContext,
     total: &'a BigUint,
@@ -615,7 +619,8 @@ fn discover_paths(
     total: &BigUint,
     max_hops: usize,
 ) -> Result<Vec<PathAllocation>, AlgorithmError> {
-    let collect_census = census_enabled() || symbolic_cut_census_enabled();
+    let collect_census =
+        census_enabled() || symbolic_cut_census_enabled() || concavity_audit_enabled();
     let mut search = PathSearch {
         ctx,
         total,
@@ -634,6 +639,9 @@ fn discover_paths(
     }
     if symbolic_cut_census_enabled() {
         emit_symbolic_allocation_cut_census(&search.census_paths, total, ctx);
+    }
+    if concavity_audit_enabled() {
+        super::concavity_audit::emit(&search.census_paths, total, ctx);
     }
 
     search.paths.sort_unstable_by(|a, b| b.amount_out.cmp(&a.amount_out));
