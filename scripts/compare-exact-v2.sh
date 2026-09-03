@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compare native Path Frank-Wolfe with the exact Uniswap V2 refinement layer.
+# Compare native Path Frank-Wolfe with the exact Uniswap V2/V3 refinement layer.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,20 +10,37 @@ NAME="${2:-exact-v2-$(date +%Y%m%d-%H%M%S)}"
 SEED="${3:-$(date +%s)}"
 AMOUNT_MULTIPLIER="${AMOUNT_MULTIPLIER:-1}"
 shift "$(( $# < 3 ? $# : 3 ))"
-BENCH_ARGS=("$@")
+
+# Keep the convenient historical trailing `live` shorthand, but translate it
+# into the clap form the benchmark actually accepts: `--market live`.
+BENCH_ARGS=()
 IS_LIVE=0
 for argument in "$@"; do
-  [[ "$argument" == "live" ]] && IS_LIVE=1
+  if [[ "$argument" == "live" ]]; then
+    IS_LIVE=1
+  else
+    BENCH_ARGS+=("$argument")
+  fi
 done
+if [[ $IS_LIVE -eq 1 ]]; then
+  BENCH_ARGS+=(--market live)
+fi
+
 FIXTURE="fynd-core/tests/fixtures/market_recording.json.zst"
 FULL_TRADES="aggregator_trades_50k_1k_usd.json"
 SAMPLE_TRADES="tools/benchmark/src/trades_sample.json"
 
-if [[ $IS_LIVE -eq 0 ]] &&
-  head -n 1 "$FIXTURE" | grep -q 'git-lfs.github.com'; then
-  echo "error: $FIXTURE is a Git LFS pointer, not the recorded market" >&2
-  echo "install Git LFS and run: git lfs pull" >&2
-  exit 1
+if [[ $IS_LIVE -eq 0 ]]; then
+  if [[ ! -f "$FIXTURE" ]]; then
+    echo "error: recorded market fixture is absent: $FIXTURE" >&2
+    echo "run this comparison live instead by appending: live" >&2
+    exit 1
+  fi
+  if head -n 1 "$FIXTURE" | grep -q 'git-lfs.github.com'; then
+    echo "error: $FIXTURE is a Git LFS pointer, not the recorded market" >&2
+    echo "install Git LFS and run: git lfs pull" >&2
+    exit 1
+  fi
 fi
 
 if [[ -f "$FULL_TRADES" ]]; then
@@ -67,7 +84,7 @@ echo "amount multiplier: $AMOUNT_MULTIPLIER"
 REPORT="bench-results/$NAME/report.md"
 ORDERS_CSV="bench-results/$NAME/orders.csv"
 echo
-echo "Native Fynd vs Fynd + exact V2 refinement:"
+echo "Native Fynd vs Fynd + exact V2/V3 refinement:"
 echo "  $REPORT"
 echo
 python3 - "$ORDERS_CSV" fynd-core/benches/tokens.json <<'PY'
