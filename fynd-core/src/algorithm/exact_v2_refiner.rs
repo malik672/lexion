@@ -86,21 +86,58 @@ fn output(paths: &[PathAllocation]) -> BigUint {
         .fold(BigUint::zero(), |sum, path| sum + &path.amount_out)
 }
 
+fn input(paths: &[PathAllocation]) -> BigUint {
+    paths
+        .iter()
+        .fold(BigUint::zero(), |sum, path| sum + &path.amount_in)
+}
+
+/// Produces a deterministic feasible seed whose allocations sum exactly to
+/// `total`. Existing allocations are preserved when they already satisfy the
+/// order conservation invariant; independently discovered paths (which are
+/// initially quoted at the full order amount) are re-seeded evenly.
+fn feasible_seed(
+    current: &[PathAllocation],
+    total: &BigUint,
+    market: &MarketState,
+) -> Result<Vec<PathAllocation>, AlgorithmError> {
+    if input(current) == *total {
+        return Ok(current.to_vec());
+    }
+
+    let count = BigUint::from(current.len() as u64);
+    let base = total / &count;
+    let remainder = (total % &count).to_usize().unwrap_or(0);
+
+    current
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let mut amount = base.clone();
+            if index < remainder {
+                amount += BigUint::from(1u8);
+            }
+            replay_path(path, amount, total, market)
+        })
+        .collect()
+}
+
 /// Improves an existing V2/V3 split using exact simulator replays. Each
 /// coordinate step preserves the pair's total input, then accepts only an
-/// exact integer-output improvement. This is deliberately conservative: the
-/// caller still compares the resulting route's post-gas net output with the
-/// native route before selecting it.
+/// exact integer-output improvement. The initial state is always a feasible
+/// allocation whose inputs sum to the order amount. This matters for
+/// independently discovered portfolios, where every path was originally
+/// quoted at the full order amount and therefore cannot itself be used as an
+/// optimization seed.
 fn refine_simulated_paths(
     current: &[PathAllocation],
     total: &BigUint,
     market: &MarketState,
 ) -> Result<Option<Vec<PathAllocation>>, AlgorithmError> {
-    let mut best = current.to_vec();
-    let baseline = output(&best);
+    let mut best = feasible_seed(current, total, market)?;
 
-    // A small fixed number of coordinate passes keeps V3 replay bounded inside
-    // the worker timeout while handling splits with more than two paths.
+    // A small fixed number of coordinate passes keeps V3 replay bounded while
+    // handling splits with more than two paths.
     for _ in 0..3 {
         let mut changed = false;
         for left in 0..best.len() {
@@ -145,7 +182,11 @@ fn refine_simulated_paths(
         }
     }
 
-    Ok((output(&best) > baseline).then_some(best))
+    // A feasible seed is itself a valid portfolio candidate. Requiring a strict
+    // improvement over the seed incorrectly discarded symmetric V3 portfolios:
+    // equal pools are already optimal at the equal seed and need no coordinate
+    // move before being compared against the native route.
+    Ok(Some(best))
 }
 
 impl ContinuousCpmm {
