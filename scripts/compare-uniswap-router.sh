@@ -14,6 +14,8 @@ fi
 
 RUN_DIR="${1:-bench-results/v2-v3-live}"
 TOOL_DIR="$REPO_ROOT/tools/uniswap-router-bench"
+DEPS_STAMP="$TOOL_DIR/.deps-version"
+EXPECTED_DEPS="sor-4.31.10-release-graph-v1"
 
 if [[ -z "${RPC_URL:-}" ]]; then
   echo "error: RPC_URL is not set (put it in .env)" >&2
@@ -28,14 +30,27 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
-# Keep this legacy dependency stack on an LTS Node runtime. SOR 4.31.10 pulls several older
-# transpiled SDK packages whose class inheritance can fail on bleeding-edge Node releases.
+# Keep this legacy dependency stack on an LTS Node runtime.
 NODE20=(npx --yes node@20)
 
-# npm is cheap when already up to date, and rerunning it guarantees package.json changes are
-# reflected locally instead of leaving a stale node_modules tree from an earlier harness revision.
-echo "Checking pinned Uniswap Smart Order Router benchmark dependencies ..."
-npm install --prefix "$TOOL_DIR" --no-audit --no-fund >/dev/null
+# SOR 4.31.10 was released/tested with sdk-core 7.10.1, router-sdk 2.3.5,
+# v2-sdk 4.17.0 and v3-sdk 3.27.0. A normal install years later can resolve
+# newer packages through SOR's caret ranges, or preserve a stale lock generated
+# by an older revision of this harness. Rebuild once whenever our pinned graph changes.
+if [[ ! -f "$DEPS_STAMP" ]] || [[ "$(cat "$DEPS_STAMP")" != "$EXPECTED_DEPS" ]]; then
+  echo "Rebuilding pinned Uniswap SOR dependency graph ..."
+  rm -rf "$TOOL_DIR/node_modules" "$TOOL_DIR/package-lock.json"
+  npm install --prefix "$TOOL_DIR" --no-audit --no-fund >/dev/null
+  printf '%s\n' "$EXPECTED_DEPS" > "$DEPS_STAMP"
+else
+  echo "Checking pinned Uniswap Smart Order Router benchmark dependencies ..."
+  npm install --prefix "$TOOL_DIR" --no-audit --no-fund >/dev/null
+fi
+
+echo "Installed Uniswap SDK graph:"
+npm ls --prefix "$TOOL_DIR" --depth=1 \
+  @uniswap/smart-order-router @uniswap/sdk-core @uniswap/router-sdk @uniswap/v2-sdk @uniswap/v3-sdk \
+  2>/dev/null | sed -n '1,20p' || true
 
 echo "Running same-block Fynd vs Uniswap SOR comparison (Node 20) ..."
 "${NODE20[@]}" "$TOOL_DIR/bench.cjs" "$RUN_DIR"
