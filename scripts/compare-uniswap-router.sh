@@ -40,20 +40,26 @@ rpc_works() {
   [[ "$body" == *'"result":"0x'* ]]
 }
 
-# The normal Fynd RPC may be a metered/provider URL. SOR performs many eth_call/multicall requests,
-# so validate it before starting 31 orders. UNISWAP_RPC_URL can explicitly select a benchmark RPC;
-# otherwise try RPC_URL and then the public Reth endpoint already used by the repo's dev environment.
-PRIMARY_RPC="${UNISWAP_RPC_URL:-${RPC_URL:-}}"
+# Keep the Uniswap benchmark isolated from RPC_URL. The normal Fynd RPC may be a metered/provider
+# endpoint that answers a cheap eth_blockNumber preflight but rejects or resets under SOR's heavy
+# eth_call/multicall workload. Use the repo's Reth endpoint by default; UNISWAP_RPC_URL is the
+# explicit escape hatch when a different archive-capable RPC is desired.
+PRIMARY_RPC="${UNISWAP_RPC_URL:-}"
 FALLBACK_RPC="${FORK_RPC_URL:-$DEFAULT_FALLBACK_RPC}"
-if [[ -n "$PRIMARY_RPC" ]] && rpc_works "$PRIMARY_RPC"; then
-  export UNISWAP_RPC_URL="$PRIMARY_RPC"
-  echo "Uniswap RPC: primary endpoint passed preflight"
-elif [[ "$FALLBACK_RPC" != "$PRIMARY_RPC" ]] && rpc_works "$FALLBACK_RPC"; then
+if [[ -n "$PRIMARY_RPC" ]]; then
+  if rpc_works "$PRIMARY_RPC"; then
+    export UNISWAP_RPC_URL="$PRIMARY_RPC"
+    echo "Uniswap RPC: explicit UNISWAP_RPC_URL passed preflight"
+  else
+    echo "error: UNISWAP_RPC_URL failed preflight" >&2
+    exit 1
+  fi
+elif rpc_works "$FALLBACK_RPC"; then
   export UNISWAP_RPC_URL="$FALLBACK_RPC"
-  echo "warning: primary RPC failed preflight; using repo fallback Reth endpoint" >&2
+  echo "Uniswap RPC: using repo Reth endpoint"
 else
-  echo "error: no usable Ethereum RPC for Uniswap SOR" >&2
-  echo "set UNISWAP_RPC_URL in .env to a mainnet RPC that permits eth_call/multicall" >&2
+  echo "error: repo Reth endpoint is unavailable" >&2
+  echo "set UNISWAP_RPC_URL in .env to an archive-capable mainnet RPC that permits eth_call/multicall" >&2
   exit 1
 fi
 
