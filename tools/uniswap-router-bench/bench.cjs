@@ -126,8 +126,8 @@ function routeSummary(route) {
 async function main() {
   const runDir = process.argv[2];
   if (!runDir) die('usage: node bench.cjs <bench-results/run-dir>');
-  const rpcUrl = process.env.RPC_URL;
-  if (!rpcUrl) die('RPC_URL is not set');
+  const rpcUrl = process.env.UNISWAP_RPC_URL || process.env.RPC_URL;
+  if (!rpcUrl) die('UNISWAP_RPC_URL/RPC_URL is not set');
 
   const ordersPath = path.join(runDir, 'orders.csv');
   if (!fs.existsSync(ordersPath)) die(`${ordersPath} does not exist`);
@@ -236,7 +236,6 @@ async function main() {
         block_number: context.blockNumber,
         gas_price_gwei: context.gasPriceGwei,
         uniswap_sor_version: require('@uniswap/smart-order-router/package.json').version,
-        node_version: process.version,
         protocols: ['V2', 'V3', 'MIXED'],
         max_swaps_per_path: 2,
         max_splits: 4,
