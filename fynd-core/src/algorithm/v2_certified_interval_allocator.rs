@@ -125,15 +125,16 @@ fn exact_output(
     let left_amount = total - x;
     let left_desc = descriptors(&current[0]);
     let right_desc = descriptors(&current[1]);
-    *replays += 2;
     let left = if left_amount.is_zero() {
         BigUint::zero()
     } else {
+        *replays += 1;
         simulate_path(&left_desc, &left_amount, market, &MarketOverrides::empty()).ok()?.amount_out
     };
     let right = if x.is_zero() {
         BigUint::zero()
     } else {
+        *replays += 1;
         simulate_path(&right_desc, x, market, &MarketOverrides::empty()).ok()?.amount_out
     };
     Some(left + right)
@@ -286,7 +287,7 @@ pub(super) fn shadow_compare(
     let (Some(left_single), Some(right_single)) = (left_single, right_single) else {
         return Ok(());
     };
-    let incumbent = left_single.max(right_single);
+    let incumbent = left_single.clone().max(right_single.clone());
     let mut best = incumbent.clone();
     let mut best_x = if right_single >= left_single { total.clone() } else { BigUint::zero() };
 
