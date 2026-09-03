@@ -1,10 +1,7 @@
-//! Shadow allocator for certified two-path Uniswap V2 refinement.
+//! Certified two-path Uniswap V2 interval allocator and shadow differential.
 //!
-//! This module never changes production routing. It uses the continuous no-floor
-//! CPMM composition as a one-sided majorant, recursively discards allocation
-//! intervals that cannot beat an exact singleton incumbent, and exact-replays a
-//! small candidate set only inside surviving leaves. The result is compared with
-//! the existing V2 allocator by the caller.
+//! The continuous no-floor CPMM composition is used only as a one-sided
+//! majorant and search heuristic. Every returned allocation is exact-replayed.
 
 use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive, Zero};
@@ -114,6 +111,39 @@ fn descriptors(path: &PathAllocation) -> Vec<HopDescriptor> {
     path.hops.iter().map(|hop| hop.descriptor.clone()).collect()
 }
 
+fn replay_one(
+    path: &PathAllocation,
+    amount: &BigUint,
+    total: &BigUint,
+    market: &MarketState,
+) -> Result<PathAllocation, AlgorithmError> {
+    if amount.is_zero() {
+        let mut zeroed = path.clone();
+        zeroed.flow_fraction = 0.0;
+        zeroed.amount_in = BigUint::zero();
+        zeroed.amount_out = BigUint::zero();
+        zeroed.marginal_price_product = 0.0;
+        for hop in &mut zeroed.hops {
+            hop.amount_out = BigUint::zero();
+            hop.gas = BigUint::zero();
+        }
+        return Ok(zeroed);
+    }
+
+    let desc = descriptors(path);
+    let sim = simulate_path(&desc, amount, market, &MarketOverrides::empty())?;
+    let mut replayed = path.clone();
+    replayed.flow_fraction = amount.to_f64().unwrap_or(0.0) / total.to_f64().unwrap_or(1.0);
+    replayed.amount_in = amount.clone();
+    replayed.amount_out = sim.amount_out;
+    replayed.marginal_price_product = sim.marginal_price_product;
+    for (hop, (amount_out, gas)) in replayed.hops.iter_mut().zip(sim.hop_results) {
+        hop.amount_out = amount_out;
+        hop.gas = gas;
+    }
+    Ok(replayed)
+}
+
 fn exact_output(
     current: &[PathAllocation],
     total: &BigUint,
@@ -125,24 +155,27 @@ fn exact_output(
         return None;
     }
     let left_amount = total - x;
-    let left_desc = descriptors(&current[0]);
-    let right_desc = descriptors(&current[1]);
     let left = if left_amount.is_zero() {
         BigUint::zero()
     } else {
         *replays += 1;
-        simulate_path(&left_desc, &left_amount, market, &MarketOverrides::empty()).ok()?.amount_out
+        replay_one(&current[0], &left_amount, total, market).ok()?.amount_out
     };
     let right = if x.is_zero() {
         BigUint::zero()
     } else {
         *replays += 1;
-        simulate_path(&right_desc, x, market, &MarketOverrides::empty()).ok()?.amount_out
+        replay_one(&current[1], x, total, market).ok()?.amount_out
     };
     Some(left + right)
 }
 
-fn derivative_nonnegative(left: &Curve, right: &Curve, total: &BigUint, x: &BigUint) -> Option<bool> {
+fn derivative_nonnegative(
+    left: &Curve,
+    right: &Curve,
+    total: &BigUint,
+    x: &BigUint,
+) -> Option<bool> {
     let left_amount = total - x;
     let ld = left.derivative(&left_amount)?;
     let rd = right.derivative(x)?;
@@ -166,9 +199,15 @@ fn interval_upper(
     let rd = right.derivative(&mid)?;
     let nonnegative = &rd.num * &ld.den >= &ld.num * &rd.den;
     let slope = if nonnegative {
-        Fraction::new(&rd.num * &ld.den - &ld.num * &rd.den, &rd.den * &ld.den)?
+        Fraction::new(
+            &rd.num * &ld.den - &ld.num * &rd.den,
+            &rd.den * &ld.den,
+        )?
     } else {
-        Fraction::new(&ld.num * &rd.den - &rd.num * &ld.den, &rd.den * &ld.den)?
+        Fraction::new(
+            &ld.num * &rd.den - &rd.num * &ld.den,
+            &rd.den * &ld.den,
+        )?
     };
     let distance = if nonnegative { hi - &mid } else { &mid - lo };
     Some(value.add(&slope.mul_uint(&distance)).ceil())
@@ -216,8 +255,28 @@ fn collect_survivors(
         leaves.push((lo, hi));
         return;
     }
-    collect_survivors(left, right, total, incumbent, lo.clone(), mid.clone(), depth + 1, stats, leaves);
-    collect_survivors(left, right, total, incumbent, mid, hi, depth + 1, stats, leaves);
+    collect_survivors(
+        left,
+        right,
+        total,
+        incumbent,
+        lo.clone(),
+        mid.clone(),
+        depth + 1,
+        stats,
+        leaves,
+    );
+    collect_survivors(
+        left,
+        right,
+        total,
+        incumbent,
+        mid,
+        hi,
+        depth + 1,
+        stats,
+        leaves,
+    );
 }
 
 fn stationary_point(
@@ -252,7 +311,13 @@ fn push_unique(points: &mut Vec<BigUint>, point: BigUint, lo: &BigUint, hi: &Big
     }
 }
 
-fn leaf_points(left: &Curve, right: &Curve, total: &BigUint, lo: &BigUint, hi: &BigUint) -> Vec<BigUint> {
+fn candidate_points(
+    left: &Curve,
+    right: &Curve,
+    total: &BigUint,
+    lo: &BigUint,
+    hi: &BigUint,
+) -> Vec<BigUint> {
     let mut points = Vec::new();
     push_unique(&mut points, lo.clone(), lo, hi);
     push_unique(&mut points, hi.clone(), lo, hi);
@@ -268,6 +333,88 @@ fn leaf_points(left: &Curve, right: &Curve, total: &BigUint, lo: &BigUint, hi: &
         }
     }
     points
+}
+
+fn search_best_x(
+    current: &[PathAllocation],
+    total: &BigUint,
+    market: &MarketState,
+) -> Option<(BigUint, BigUint, Stats)> {
+    if current.len() != 2 || total.is_zero() {
+        return None;
+    }
+    let (Some(left), Some(right)) = (curve(&current[0], market), curve(&current[1], market)) else {
+        return None;
+    };
+
+    let mut stats = Stats::default();
+    let left_single = exact_output(current, total, &BigUint::zero(), market, &mut stats.replays)?;
+    let right_single = exact_output(current, total, total, market, &mut stats.replays)?;
+    let mut best = left_single.clone().max(right_single.clone());
+    let mut best_x = if right_single >= left_single {
+        total.clone()
+    } else {
+        BigUint::zero()
+    };
+
+    // Seed the incumbent around the global continuous stationary point before
+    // branching. This keeps the proof unchanged while making the tangent bounds
+    // dramatically more decisive on useful split pairs.
+    for x in candidate_points(&left, &right, total, &BigUint::zero(), total) {
+        if let Some(value) = exact_output(current, total, &x, market, &mut stats.replays) {
+            if value > best {
+                best = value;
+                best_x = x;
+            }
+        }
+    }
+
+    let seed_best = best.clone();
+    let mut leaves = Vec::new();
+    collect_survivors(
+        &left,
+        &right,
+        total,
+        &seed_best,
+        BigUint::zero(),
+        total.clone(),
+        0,
+        &mut stats,
+        &mut leaves,
+    );
+
+    for (lo, hi) in &leaves {
+        for x in candidate_points(&left, &right, total, lo, hi) {
+            if let Some(value) = exact_output(current, total, &x, market, &mut stats.replays) {
+                if value > best {
+                    best = value;
+                    best_x = x;
+                }
+            }
+        }
+    }
+
+    Some((best_x, best, stats))
+}
+
+pub(super) fn certified_allocate(
+    current: &[PathAllocation],
+    total: &BigUint,
+    market: &MarketState,
+) -> Result<Option<Vec<PathAllocation>>, AlgorithmError> {
+    if current.len() != 2 || total.is_zero() {
+        return Ok(None);
+    }
+    let Some((best_x, _, _)) = search_best_x(current, total, market) else {
+        return Ok(None);
+    };
+
+    let left_amount = total - &best_x;
+    let left = replay_one(&current[0], &left_amount, total, market)?;
+    let right = replay_one(&current[1], &best_x, total, market)?;
+    let mut result = vec![left, right];
+    result.retain(|path| !path.amount_in.is_zero());
+    Ok(Some(result))
 }
 
 fn build_full_path(
@@ -297,49 +444,20 @@ pub(super) fn shadow_compare(
     market: &MarketState,
     baseline: &[PathAllocation],
 ) -> Result<(), AlgorithmError> {
-    if current.len() != 2 || total.is_zero() {
-        return Ok(());
-    }
-    let (Some(left), Some(right)) = (curve(&current[0], market), curve(&current[1], market)) else {
+    let Some((best_x, best, stats)) = search_best_x(current, total, market) else {
         return Ok(());
     };
 
-    let mut stats = Stats::default();
-    let left_single = exact_output(current, total, &BigUint::zero(), market, &mut stats.replays);
-    let right_single = exact_output(current, total, total, market, &mut stats.replays);
-    let (Some(left_single), Some(right_single)) = (left_single, right_single) else {
-        return Ok(());
+    let baseline_out = baseline
+        .iter()
+        .fold(BigUint::zero(), |sum, path| sum + &path.amount_out);
+    let relation = if best < baseline_out {
+        "LOSS"
+    } else if best > baseline_out {
+        "WIN"
+    } else {
+        "TIE"
     };
-    let incumbent = left_single.clone().max(right_single.clone());
-    let mut best = incumbent.clone();
-    let mut best_x = if right_single >= left_single { total.clone() } else { BigUint::zero() };
-
-    let mut leaves = Vec::new();
-    collect_survivors(
-        &left,
-        &right,
-        total,
-        &incumbent,
-        BigUint::zero(),
-        total.clone(),
-        0,
-        &mut stats,
-        &mut leaves,
-    );
-
-    for (lo, hi) in &leaves {
-        for x in leaf_points(&left, &right, total, lo, hi) {
-            if let Some(value) = exact_output(current, total, &x, market, &mut stats.replays) {
-                if value > best {
-                    best = value;
-                    best_x = x;
-                }
-            }
-        }
-    }
-
-    let baseline_out = baseline.iter().fold(BigUint::zero(), |sum, path| sum + &path.amount_out);
-    let relation = if best < baseline_out { "LOSS" } else if best > baseline_out { "WIN" } else { "TIE" };
     let dead_bps = ((&stats.dead_width * BigUint::from(10_000u64)) / total)
         .to_u64()
         .unwrap_or(10_000)
