@@ -10,7 +10,7 @@ use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive, Zero};
 use tycho_simulation::evm::protocol::uniswap_v2::state::UniswapV2State;
 
-use super::{
+use super::super::{
     split_primitives::{simulate_path, HopDescriptor, MarketOverrides, PathAllocation},
     AlgorithmError,
 };
