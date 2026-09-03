@@ -5,12 +5,20 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Load local credentials/config if present. Values already exported in the shell win.
+if [[ -f "$REPO_ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/.env"
+  set +a
+fi
+
 AMOUNT_USDT="${1:?usage: $0 <USDT amount, e.g. 100000>}"
 FYND_PORT="${FYND_PORT:-3001}"
 FYND_URL="${FYND_URL:-http://127.0.0.1:$FYND_PORT}"
 TYCHO_URL="${TYCHO_URL:?set TYCHO_URL, e.g. tycho-fynd-ethereum.propellerheads.xyz}"
-TYCHO_API_KEY="${TYCHO_API_KEY:?set TYCHO_API_KEY}"
-RPC_URL="${RPC_URL:?set RPC_URL}"
+TYCHO_API_KEY="${TYCHO_API_KEY:?set TYCHO_API_KEY or put it in .env}"
+RPC_URL="${RPC_URL:?set RPC_URL or put it in .env}"
 SENDER="${SENDER:-0x000000000000000000000000000000000000BEEF}"
 LOG="target/hybrid-usdt-weth-$FYND_PORT.log"
 STARTED_SERVER=0
