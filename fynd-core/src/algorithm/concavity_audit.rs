@@ -93,6 +93,15 @@ fn protocol_word(path: &[HopDescriptor], ctx: &BellmanFordContext) -> String {
         .collect()
 }
 
+fn is_v2_only(path: &[HopDescriptor], ctx: &BellmanFordContext) -> bool {
+    !path.is_empty()
+        && path.iter().all(|hop| {
+            ctx.market_data
+                .get_simulation_state(&hop.component_id)
+                .is_some_and(|state| state.as_any().downcast_ref::<UniswapV2State>().is_some())
+        })
+}
+
 /// Coarser path family used by the defect census. Unlike the protocol word,
 /// this separates one-hop from multi-hop paths so integer projection after an
 /// intermediate hop can be measured directly.
@@ -152,11 +161,7 @@ impl DefectStats {
         debug_assert!(denominator > &BigInt::from(0u8));
         self.violating_triples += 1;
 
-        let one = BigInt::from(1u8);
-        let ceil_raw_i = (numerator + denominator - &one) / denominator;
-        let ceil_raw = ceil_raw_i
-            .to_biguint()
-            .unwrap_or_else(|| BigUint::from(0u8));
+        let ceil_raw = ceil_ratio(numerator, denominator);
         if ceil_raw <= BigUint::from(1u8) {
             self.raw_le_1 += 1;
         }
@@ -179,8 +184,9 @@ impl DefectStats {
         }
         let ppm_num = numerator * BigInt::from(1_000_000u64);
         let ppm_den = denominator * BigInt::from(midpoint.clone());
-        let ppm_ceil_i = (&ppm_num + &ppm_den - &one) / &ppm_den;
-        let ppm_ceil = ppm_ceil_i.to_u64().unwrap_or(u64::MAX);
+        let ppm_ceil = ceil_ratio(&ppm_num, &ppm_den)
+            .to_u64()
+            .unwrap_or(u64::MAX);
         if ppm_ceil <= 1 {
             self.ppm_le_1 += 1;
         }
@@ -190,6 +196,58 @@ impl DefectStats {
             self.ppm_gt_10 += 1;
         }
         self.max_ppm_ceil = self.max_ppm_ceil.max(ppm_ceil);
+    }
+}
+
+fn ceil_ratio(numerator: &BigInt, denominator: &BigInt) -> BigUint {
+    debug_assert!(numerator >= &BigInt::from(0u8));
+    debug_assert!(denominator > &BigInt::from(0u8));
+    let one = BigInt::from(1u8);
+    ((numerator + denominator - &one) / denominator)
+        .to_biguint()
+        .unwrap_or_else(|| BigUint::from(0u8))
+}
+
+#[derive(Default)]
+struct V2SlackStats {
+    pairs: usize,
+    complete: usize,
+    incomplete: usize,
+    triples: usize,
+    violating_triples: usize,
+    slack_1_failures: usize,
+    slack_2_failures: usize,
+    slack_3_failures: usize,
+    slack_4_failures: usize,
+    max_hops_failures: usize,
+    sum_hops_failures: usize,
+    max_required_slack: BigUint,
+}
+
+impl V2SlackStats {
+    fn observe_defect(&mut self, defect: &BigUint, left_hops: usize, right_hops: usize) {
+        self.violating_triples += 1;
+        if defect > &BigUint::from(1u8) {
+            self.slack_1_failures += 1;
+        }
+        if defect > &BigUint::from(2u8) {
+            self.slack_2_failures += 1;
+        }
+        if defect > &BigUint::from(3u8) {
+            self.slack_3_failures += 1;
+        }
+        if defect > &BigUint::from(4u8) {
+            self.slack_4_failures += 1;
+        }
+        if defect > &BigUint::from(left_hops.max(right_hops)) {
+            self.max_hops_failures += 1;
+        }
+        if defect > &BigUint::from(left_hops + right_hops) {
+            self.sum_hops_failures += 1;
+        }
+        if defect > &self.max_required_slack {
+            self.max_required_slack = defect.clone();
+        }
     }
 }
 
@@ -205,6 +263,17 @@ struct Violation {
     y2: BigUint,
     defect_ceil_raw: BigUint,
     defect_ppm_ceil: u64,
+}
+
+struct V2SlackCounterexample {
+    left: usize,
+    right: usize,
+    x0: BigUint,
+    x1: BigUint,
+    x2: BigUint,
+    defect: BigUint,
+    max_hops_slack: usize,
+    sum_hops_slack: usize,
 }
 
 /// Exact-grid differential for the coupled objective
@@ -225,6 +294,10 @@ struct Violation {
 ///
 /// The numerator/denominator are kept exact; buckets use ceiling division so a
 /// fractional raw-unit violation is never understated.
+///
+/// `V2ConcavitySlackAuditV1` narrows the same exact samples to V2-only paths.
+/// It is still a falsification census, not a theorem: a candidate slack is
+/// counted as failed whenever the observed local defect exceeds it.
 pub(super) fn emit(
     paths: &[Vec<HopDescriptor>],
     total: &BigUint,
@@ -238,6 +311,9 @@ pub(super) fn emit(
     let mut classes: FxHashMap<String, ClassStats> = FxHashMap::default();
     let mut defect_classes: FxHashMap<String, DefectStats> = FxHashMap::default();
     let mut defect_total = DefectStats::default();
+    let mut v2_slack_classes: FxHashMap<String, V2SlackStats> = FxHashMap::default();
+    let mut v2_slack_total = V2SlackStats::default();
+    let mut first_v2_counterexamples = Vec::new();
     let mut first_violations = Vec::new();
     let mut pairs = 0usize;
     let mut complete = 0usize;
@@ -263,7 +339,16 @@ pub(super) fn emit(
                 path_family(&paths[left], ctx),
                 path_family(&paths[right], ctx)
             );
+            let v2_only = is_v2_only(&paths[left], ctx) && is_v2_only(&paths[right], ctx);
+            let v2_hop_class = format!("{}+{} hops", paths[left].len(), paths[right].len());
             classes.entry(class.clone()).or_default().pairs += 1;
+            if v2_only {
+                v2_slack_total.pairs += 1;
+                v2_slack_classes
+                    .entry(v2_hop_class.clone())
+                    .or_default()
+                    .pairs += 1;
+            }
 
             let mut points = Vec::with_capacity((GRID_CELLS + 1) as usize);
             let mut pair_complete = true;
@@ -283,10 +368,24 @@ pub(super) fn emit(
             if !pair_complete || points.len() < 3 {
                 incomplete += 1;
                 stats.incomplete += 1;
+                if v2_only {
+                    v2_slack_total.incomplete += 1;
+                    v2_slack_classes
+                        .get_mut(&v2_hop_class)
+                        .expect("V2 class inserted above")
+                        .incomplete += 1;
+                }
                 continue;
             }
             complete += 1;
             stats.complete += 1;
+            if v2_only {
+                v2_slack_total.complete += 1;
+                v2_slack_classes
+                    .get_mut(&v2_hop_class)
+                    .expect("V2 class inserted above")
+                    .complete += 1;
+            }
 
             let mut pair_violates = false;
             for w in points.windows(3) {
@@ -302,10 +401,18 @@ pub(super) fn emit(
                 let dy2 = BigInt::from(y2.clone()) - BigInt::from(y1.clone());
                 triples += 1;
                 stats.triples += 1;
+                if v2_only {
+                    v2_slack_total.triples += 1;
+                    v2_slack_classes
+                        .get_mut(&v2_hop_class)
+                        .expect("V2 class inserted above")
+                        .triples += 1;
+                }
 
                 let defect_num = &dy2 * &dx1 - &dy1 * &dx2;
                 if defect_num > BigInt::from(0u8) {
                     let defect_den = &dx1 + &dx2;
+                    let defect_ceil_raw = ceil_ratio(&defect_num, &defect_den);
                     bad_triples += 1;
                     stats.bad_triples += 1;
                     pair_violates = true;
@@ -316,18 +423,42 @@ pub(super) fn emit(
                         .or_default()
                         .observe(&defect_num, &defect_den, y1);
 
+                    if v2_only {
+                        let left_hops = paths[left].len();
+                        let right_hops = paths[right].len();
+                        v2_slack_total.observe_defect(
+                            &defect_ceil_raw,
+                            left_hops,
+                            right_hops,
+                        );
+                        v2_slack_classes
+                            .get_mut(&v2_hop_class)
+                            .expect("V2 class inserted above")
+                            .observe_defect(&defect_ceil_raw, left_hops, right_hops);
+                        if first_v2_counterexamples.len() < 12
+                            && (defect_ceil_raw > BigUint::from(2u8)
+                                || defect_ceil_raw > BigUint::from(left_hops.max(right_hops)))
+                        {
+                            first_v2_counterexamples.push(V2SlackCounterexample {
+                                left,
+                                right,
+                                x0: x0.clone(),
+                                x1: x1.clone(),
+                                x2: x2.clone(),
+                                defect: defect_ceil_raw.clone(),
+                                max_hops_slack: left_hops.max(right_hops),
+                                sum_hops_slack: left_hops + right_hops,
+                            });
+                        }
+                    }
+
                     if first_violations.len() < 12 {
-                        let one = BigInt::from(1u8);
-                        let raw_i = (&defect_num + &defect_den - &one) / &defect_den;
-                        let defect_ceil_raw = raw_i
-                            .to_biguint()
-                            .unwrap_or_else(|| BigUint::from(0u8));
                         let defect_ppm_ceil = if y1 == &BigUint::from(0u8) {
                             u64::MAX
                         } else {
                             let ppm_num = &defect_num * BigInt::from(1_000_000u64);
                             let ppm_den = &defect_den * BigInt::from(y1.clone());
-                            ((&ppm_num + &ppm_den - &one) / &ppm_den)
+                            ceil_ratio(&ppm_num, &ppm_den)
                                 .to_u64()
                                 .unwrap_or(u64::MAX)
                         };
@@ -445,4 +576,70 @@ pub(super) fn emit(
         }
     }
     eprintln!("=== end ConcavityDefectCensusV1 ===\n");
+
+    eprintln!("=== V2ConcavitySlackAuditV1 ===");
+    eprintln!("V2-only pool-disjoint pairs:   {}", v2_slack_total.pairs);
+    eprintln!("complete V2-only pairs:        {}", v2_slack_total.complete);
+    eprintln!("incomplete V2-only pairs:      {}", v2_slack_total.incomplete);
+    eprintln!("checked V2-only triples:       {}", v2_slack_total.triples);
+    eprintln!("violating V2-only triples:     {}", v2_slack_total.violating_triples);
+    eprintln!("candidate slack=1 failures:    {}", v2_slack_total.slack_1_failures);
+    eprintln!("candidate slack=2 failures:    {}", v2_slack_total.slack_2_failures);
+    eprintln!("candidate slack=3 failures:    {}", v2_slack_total.slack_3_failures);
+    eprintln!("candidate slack=4 failures:    {}", v2_slack_total.slack_4_failures);
+    eprintln!("candidate max(hops) failures:  {}", v2_slack_total.max_hops_failures);
+    eprintln!("candidate sum(hops) failures:  {}", v2_slack_total.sum_hops_failures);
+    eprintln!("max observed required slack:   {} raw units", v2_slack_total.max_required_slack);
+
+    let mut v2_rows = v2_slack_classes.into_iter().collect::<Vec<_>>();
+    v2_rows.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    if !v2_rows.is_empty() {
+        eprintln!("V2 hop-count classes:");
+        for (class, s) in v2_rows {
+            eprintln!(
+                "  {:<10} pairs={} complete={} incomplete={} triples={} bad={} fail1={} fail2={} fail3={} fail4={} fail_maxh={} fail_sumh={} max_slack={}",
+                class,
+                s.pairs,
+                s.complete,
+                s.incomplete,
+                s.triples,
+                s.violating_triples,
+                s.slack_1_failures,
+                s.slack_2_failures,
+                s.slack_3_failures,
+                s.slack_4_failures,
+                s.max_hops_failures,
+                s.sum_hops_failures,
+                s.max_required_slack
+            );
+        }
+    }
+
+    if !first_v2_counterexamples.is_empty() {
+        eprintln!("first V2 slack counterexamples (up to 12):");
+        for v in first_v2_counterexamples {
+            let left = paths[v.left]
+                .iter()
+                .map(|hop| hop.component_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            let right = paths[v.right]
+                .iter()
+                .map(|hop| hop.component_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            eprintln!(
+                "  left={} right={} x=[{}, {}, {}] defect={} max(hops)={} sum(hops)={}",
+                left,
+                right,
+                v.x0,
+                v.x1,
+                v.x2,
+                v.defect,
+                v.max_hops_slack,
+                v.sum_hops_slack
+            );
+        }
+    }
+    eprintln!("=== end V2ConcavitySlackAuditV1 ===\n");
 }
