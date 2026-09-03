@@ -7,6 +7,15 @@
 # Registers an EXIT trap to kill background processes on exit.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Load local credentials/config if present. The file is gitignored; see .env.example.
+if [[ -f "$REPO_ROOT/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/.env"
+    set +a
+fi
+
 FORK_RPC_URL="${FORK_RPC_URL:-https://reth-ethereum.ithaca.xyz/rpc}"
 ANVIL_RPC_URL="http://localhost:8545"
 FYND_URL="http://localhost:3000"
@@ -34,7 +43,7 @@ check_deps() {
         exit 1
     fi
     if [[ -z "${TYCHO_API_KEY:-}" ]]; then
-        echo "TYCHO_API_KEY is not set. Get one at: https://t.me/fynd_portal_bot"
+        echo "TYCHO_API_KEY is not set. Put it in .env or get one at: https://t.me/fynd_portal_bot"
         exit 1
     fi
 }
