@@ -5,9 +5,8 @@ const path = require('path');
 const { parse } = require('csv-parse/sync');
 const { ethers } = require('ethers');
 const JSBI = require('jsbi');
-const { AlphaRouter } = require('@uniswap/smart-order-router');
+const { AlphaRouter, TO_PROTOCOL } = require('@uniswap/smart-order-router');
 const { CurrencyAmount, Ether, Token, TradeType } = require('@uniswap/sdk-core');
-const { Protocol } = require('@uniswap/router-sdk');
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 const CHAIN_ID = 1;
@@ -147,8 +146,10 @@ async function main() {
     },
   };
   const router = new AlphaRouter({ chainId: CHAIN_ID, provider, gasPriceProvider });
+  const protocols = [TO_PROTOCOL('v2'), TO_PROTOCOL('v3'), TO_PROTOCOL('mixed')];
 
   console.log(`Uniswap SOR ${require('@uniswap/smart-order-router/package.json').version}`);
+  console.log(`node:       ${process.version}`);
   console.log(`block:      ${context.blockNumber}`);
   console.log(`gas price:  ${context.gasPriceGwei} gwei`);
   console.log('protocols:  V2,V3,MIXED');
@@ -171,7 +172,7 @@ async function main() {
     try {
       const uni = await router.route(amount, tokenOut, TradeType.EXACT_INPUT, undefined, {
         blockNumber: context.blockNumber,
-        protocols: [Protocol.V2, Protocol.V3, Protocol.MIXED],
+        protocols,
         maxSwapsPerPath: 2,
         minSplits: 1,
         maxSplits: 4,
@@ -235,6 +236,7 @@ async function main() {
         block_number: context.blockNumber,
         gas_price_gwei: context.gasPriceGwei,
         uniswap_sor_version: require('@uniswap/smart-order-router/package.json').version,
+        node_version: process.version,
         protocols: ['V2', 'V3', 'MIXED'],
         max_swaps_per_path: 2,
         max_splits: 4,
