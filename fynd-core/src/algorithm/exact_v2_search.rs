@@ -1,6 +1,7 @@
 //! Independent pool-disjoint path discovery for the exact replay refinement layer.
 
 use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use petgraph::graph::NodeIndex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tycho_simulation::evm::protocol::{
@@ -25,8 +26,17 @@ const MAX_CANDIDATE_PATHS: usize = 6;
 /// include the 25% and 10% regimes seen in live Uniswap counterexamples.
 const CENSUS_SCALES: &[(u64, u64)] = &[(1, 1), (1, 2), (1, 4), (1, 10), (1, 20)];
 
+/// Maximum dyadic refinement depth for `SymbolicAllocationCutCensusV1`.
+/// Depth six gives 64 allocation cells. It is intentionally an analysis budget,
+/// not a production routing parameter.
+const SYMBOLIC_CUT_DEPTH: usize = 6;
+
 fn census_enabled() -> bool {
     std::env::var_os("FYND_ROUTING_LANGUAGE_CENSUS").is_some()
+}
+
+fn symbolic_cut_census_enabled() -> bool {
+    std::env::var_os("FYND_SYMBOLIC_ALLOCATION_CENSUS").is_some()
 }
 
 struct PathSearch<'a> {
@@ -38,7 +48,7 @@ struct PathSearch<'a> {
     descriptors: Vec<HopDescriptor>,
     paths: Vec<PathAllocation>,
     /// Complete structural paths before full-order feasibility filtering. This is
-    /// populated only when the analysis census is enabled and never affects the
+    /// populated only when an analysis census is enabled and never affects the
     /// production candidate frontier.
     census_paths: Vec<Vec<HopDescriptor>>,
     collect_census: bool,
@@ -284,12 +294,328 @@ fn emit_language_census(
     eprintln!("=== end RoutingMultiScaleLanguageCensusV1 ===\n");
 }
 
+fn paths_are_pool_disjoint(left: &[HopDescriptor], right: &[HopDescriptor]) -> bool {
+    let used = left
+        .iter()
+        .map(|hop| hop.component_id.as_str())
+        .collect::<FxHashSet<_>>();
+    right
+        .iter()
+        .all(|hop| !used.contains(hop.component_id.as_str()))
+}
+
+struct ExactPathCache<'a> {
+    paths: &'a [Vec<HopDescriptor>],
+    ctx: &'a BellmanFordContext,
+    values: Vec<FxHashMap<BigUint, Option<BigUint>>>,
+    simulations: usize,
+}
+
+impl<'a> ExactPathCache<'a> {
+    fn new(paths: &'a [Vec<HopDescriptor>], ctx: &'a BellmanFordContext) -> Self {
+        Self {
+            paths,
+            ctx,
+            values: vec![FxHashMap::default(); paths.len()],
+            simulations: 0,
+        }
+    }
+
+    fn output(&mut self, path_index: usize, amount: &BigUint) -> Option<BigUint> {
+        if amount == &BigUint::from(0u8) {
+            return Some(BigUint::from(0u8));
+        }
+        if let Some(value) = self.values[path_index].get(amount) {
+            return value.clone();
+        }
+        self.simulations += 1;
+        let value = simulate_path(
+            &self.paths[path_index],
+            amount,
+            &self.ctx.market_data,
+            &MarketOverrides::empty(),
+        )
+        .ok()
+        .map(|sim| sim.amount_out);
+        self.values[path_index].insert(amount.clone(), value.clone());
+        value
+    }
+}
+
+#[derive(Default)]
+struct SymbolicCutStats {
+    intervals: usize,
+    certified_dead: usize,
+    unresolved_leaves: usize,
+    witness_leaves: usize,
+    endpoint_unknown: usize,
+    falsifier_violations: usize,
+    first_witness_x: Option<BigUint>,
+    best_witness: Option<BigUint>,
+}
+
+fn pair_output(
+    cache: &mut ExactPathCache<'_>,
+    anchor: usize,
+    alternative: usize,
+    total: &BigUint,
+    x: &BigUint,
+) -> Option<BigUint> {
+    if x > total {
+        return None;
+    }
+    let anchor_amount = total - x;
+    let anchor_out = cache.output(anchor, &anchor_amount)?;
+    let alternative_out = cache.output(alternative, x)?;
+    Some(anchor_out + alternative_out)
+}
+
+/// Conservative upper bound for `x in [lo, hi]` where `x` is flow sent to the
+/// alternative path. Exact-input V2/V3 path output is monotone, therefore
+///
+///   Q_anchor(T - x) <= Q_anchor(T - lo)
+///   Q_alt(x)        <= Q_alt(hi)
+///
+/// and the sum is a sound (possibly loose) upper bound. If either endpoint
+/// replay fails we return `None`: analysis must remain unknown rather than turn
+/// missing simulator information into a false impossibility proof.
+fn pair_interval_upper_bound(
+    cache: &mut ExactPathCache<'_>,
+    anchor: usize,
+    alternative: usize,
+    total: &BigUint,
+    lo: &BigUint,
+    hi: &BigUint,
+) -> Option<BigUint> {
+    let anchor_amount = total - lo;
+    let anchor_out = cache.output(anchor, &anchor_amount)?;
+    let alternative_out = cache.output(alternative, hi)?;
+    Some(anchor_out + alternative_out)
+}
+
+fn analyze_symbolic_cut(
+    cache: &mut ExactPathCache<'_>,
+    anchor: usize,
+    alternative: usize,
+    total: &BigUint,
+    incumbent: &BigUint,
+    lo: BigUint,
+    hi: BigUint,
+    depth: usize,
+    stats: &mut SymbolicCutStats,
+) {
+    stats.intervals += 1;
+
+    let Some(upper_bound) =
+        pair_interval_upper_bound(cache, anchor, alternative, total, &lo, &hi)
+    else {
+        stats.endpoint_unknown += 1;
+        return;
+    };
+
+    if upper_bound <= *incumbent {
+        // Differential falsifier: sampled concrete points inside a certified-dead
+        // interval must never beat the incumbent. The upper-bound argument is
+        // the certificate; these exact probes are only an instrumentation guard.
+        let mid = (&lo + &hi) / BigUint::from(2u8);
+        for x in [&lo, &mid, &hi] {
+            if let Some(exact) = pair_output(cache, anchor, alternative, total, x) {
+                if exact > *incumbent {
+                    stats.falsifier_violations += 1;
+                }
+            }
+        }
+        stats.certified_dead += 1;
+        return;
+    }
+
+    let mid = (&lo + &hi) / BigUint::from(2u8);
+    let mut witnessed = false;
+    for x in [&lo, &mid, &hi] {
+        if let Some(exact) = pair_output(cache, anchor, alternative, total, x) {
+            if exact > *incumbent {
+                witnessed = true;
+                if stats.first_witness_x.is_none() {
+                    stats.first_witness_x = Some(x.clone());
+                }
+                if stats.best_witness.as_ref().map_or(true, |best| exact > *best) {
+                    stats.best_witness = Some(exact);
+                }
+            }
+        }
+    }
+
+    if depth == SYMBOLIC_CUT_DEPTH || lo == hi {
+        if witnessed {
+            stats.witness_leaves += 1;
+        } else {
+            stats.unresolved_leaves += 1;
+        }
+        return;
+    }
+
+    if mid < hi {
+        analyze_symbolic_cut(
+            cache,
+            anchor,
+            alternative,
+            total,
+            incumbent,
+            lo.clone(),
+            mid.clone(),
+            depth + 1,
+            stats,
+        );
+        let right_lo = &mid + BigUint::from(1u8);
+        if right_lo <= hi {
+            analyze_symbolic_cut(
+                cache,
+                anchor,
+                alternative,
+                total,
+                incumbent,
+                right_lo,
+                hi,
+                depth + 1,
+                stats,
+            );
+        }
+    }
+}
+
+/// Analysis-only routing analogue of the scheduler's relational cut census.
+///
+/// The best exact full-order single path is the incumbent/anchor. Every
+/// pool-disjoint structural alternative receives symbolic flow `x in [0,T]`.
+/// We recursively prove allocation intervals dead using only a monotone
+/// conservative upper bound; ambiguous intervals are refined and exact point
+/// replay supplies productive witnesses. No result from this census changes the
+/// production frontier or route selection.
+fn emit_symbolic_allocation_cut_census(
+    structural_paths: &[Vec<HopDescriptor>],
+    total: &BigUint,
+    ctx: &BellmanFordContext,
+) {
+    if structural_paths.is_empty() || total == &BigUint::from(0u8) {
+        return;
+    }
+
+    let mut cache = ExactPathCache::new(structural_paths, ctx);
+    let mut full_outputs = Vec::with_capacity(structural_paths.len());
+    for index in 0..structural_paths.len() {
+        full_outputs.push(cache.output(index, total));
+    }
+    let Some((anchor, incumbent)) = full_outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output)| output.as_ref().map(|value| (index, value.clone())))
+        .max_by(|(_, a), (_, b)| a.cmp(b))
+    else {
+        eprintln!("symbolic-allocation-cut-census: no full-order feasible path");
+        return;
+    };
+
+    let mut pairs = 0usize;
+    let mut pair_root_dead = 0usize;
+    let mut pair_has_witness = 0usize;
+    let mut pair_unresolved = 0usize;
+    let mut total_intervals = 0usize;
+    let mut certified_dead = 0usize;
+    let mut unresolved_leaves = 0usize;
+    let mut witness_leaves = 0usize;
+    let mut endpoint_unknown = 0usize;
+    let mut falsifier_violations = 0usize;
+    let mut witnesses = Vec::new();
+
+    for alternative in 0..structural_paths.len() {
+        if alternative == anchor ||
+            !paths_are_pool_disjoint(&structural_paths[anchor], &structural_paths[alternative])
+        {
+            continue;
+        }
+        pairs += 1;
+        let mut stats = SymbolicCutStats::default();
+        analyze_symbolic_cut(
+            &mut cache,
+            anchor,
+            alternative,
+            total,
+            &incumbent,
+            BigUint::from(0u8),
+            total.clone(),
+            0,
+            &mut stats,
+        );
+
+        if stats.intervals == 1 && stats.certified_dead == 1 {
+            pair_root_dead += 1;
+        }
+        if stats.first_witness_x.is_some() {
+            pair_has_witness += 1;
+            witnesses.push((alternative, stats.first_witness_x.clone().unwrap()));
+        } else if stats.certified_dead == 0 || stats.unresolved_leaves > 0 || stats.endpoint_unknown > 0 {
+            pair_unresolved += 1;
+        }
+        total_intervals += stats.intervals;
+        certified_dead += stats.certified_dead;
+        unresolved_leaves += stats.unresolved_leaves;
+        witness_leaves += stats.witness_leaves;
+        endpoint_unknown += stats.endpoint_unknown;
+        falsifier_violations += stats.falsifier_violations;
+    }
+
+    let anchor_components = structural_paths[anchor]
+        .iter()
+        .map(|hop| hop.component_id.as_str())
+        .collect::<Vec<_>>()
+        .join(" -> ");
+
+    eprintln!("\n=== SymbolicAllocationCutCensusV1 ===");
+    eprintln!("structural paths:              {}", structural_paths.len());
+    eprintln!("anchor word:                   {}", protocol_word(&structural_paths[anchor], ctx));
+    eprintln!("anchor path:                   {}", anchor_components);
+    eprintln!("incumbent gross raw:           {}", incumbent);
+    eprintln!("pool-disjoint alternatives:    {}", pairs);
+    eprintln!("pair roots certified dead:     {}", pair_root_dead);
+    eprintln!("pairs with exact win witness:  {}", pair_has_witness);
+    eprintln!("pairs still unresolved:        {}", pair_unresolved);
+    eprintln!("interval nodes examined:       {}", total_intervals);
+    eprintln!("certified-dead intervals:      {}", certified_dead);
+    eprintln!("witness leaves:                {}", witness_leaves);
+    eprintln!("unresolved leaves:             {}", unresolved_leaves);
+    eprintln!("endpoint-unknown intervals:    {}", endpoint_unknown);
+    eprintln!("exact simulator calls:         {}", cache.simulations);
+    eprintln!("dead-certificate violations:   {}", falsifier_violations);
+
+    if !witnesses.is_empty() {
+        eprintln!("productive alternatives (up to 12):");
+        for (alternative, x) in witnesses.into_iter().take(12) {
+            let bps = ((&x * BigUint::from(10_000u64)) / total)
+                .to_u64()
+                .unwrap_or(0);
+            let components = structural_paths[alternative]
+                .iter()
+                .map(|hop| hop.component_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            eprintln!(
+                "  witness~{}.{:02}% word={} {}",
+                bps / 100,
+                bps % 100,
+                protocol_word(&structural_paths[alternative], ctx),
+                components
+            );
+        }
+    }
+    eprintln!("=== end SymbolicAllocationCutCensusV1 ===\n");
+}
+
 fn discover_paths(
     ctx: &BellmanFordContext,
     total: &BigUint,
     max_hops: usize,
 ) -> Result<Vec<PathAllocation>, AlgorithmError> {
-    let collect_census = census_enabled();
+    let collect_census = census_enabled() || symbolic_cut_census_enabled();
     let mut search = PathSearch {
         ctx,
         total,
@@ -303,8 +629,11 @@ fn discover_paths(
     };
     search.visit(ctx.token_in_node)?;
 
-    if collect_census {
+    if census_enabled() {
         emit_language_census(&search.census_paths, total, ctx);
+    }
+    if symbolic_cut_census_enabled() {
+        emit_symbolic_allocation_cut_census(&search.census_paths, total, ctx);
     }
 
     search.paths.sort_unstable_by(|a, b| b.amount_out.cmp(&a.amount_out));
