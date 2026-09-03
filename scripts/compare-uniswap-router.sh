@@ -28,10 +28,14 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ ! -d "$TOOL_DIR/node_modules/@uniswap/smart-order-router" ]]; then
-  echo "Installing pinned Uniswap Smart Order Router benchmark dependencies ..."
-  npm install --prefix "$TOOL_DIR" --no-audit --no-fund
-fi
+# Keep this legacy dependency stack on an LTS Node runtime. SOR 4.31.10 pulls several older
+# transpiled SDK packages whose class inheritance can fail on bleeding-edge Node releases.
+NODE20=(npx --yes node@20)
 
-echo "Running same-block Fynd vs Uniswap SOR comparison ..."
-node "$TOOL_DIR/bench.cjs" "$RUN_DIR"
+# npm is cheap when already up to date, and rerunning it guarantees package.json changes are
+# reflected locally instead of leaving a stale node_modules tree from an earlier harness revision.
+echo "Checking pinned Uniswap Smart Order Router benchmark dependencies ..."
+npm install --prefix "$TOOL_DIR" --no-audit --no-fund >/dev/null
+
+echo "Running same-block Fynd vs Uniswap SOR comparison (Node 20) ..."
+"${NODE20[@]}" "$TOOL_DIR/bench.cjs" "$RUN_DIR"
