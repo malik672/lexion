@@ -14,6 +14,7 @@
 use std::{env, str::FromStr, time::Duration};
 
 use alloy::{
+    eips::BlockNumberOrTag,
     hex,
     network::Ethereum,
     primitives::{Address, B256, U256},
@@ -83,6 +84,14 @@ struct Cli {
     #[arg(long)]
     execute: bool,
 
+    /// Maximum number of blocks allowed between quoting and submission.
+    #[arg(long, default_value_t = 1u64)]
+    max_quote_block_age: u64,
+
+    /// Dry-run the same signed quote at this many consecutive chain heads.
+    #[arg(long, default_value_t = 1u16)]
+    shadow_blocks: u16,
+
     /// Permit2 contract address (defaults to the canonical cross-chain deployment)
     #[arg(long, default_value = "0x000000000022D473030F116dDEE9F6B43aC78BA3")]
     permit2: String,
@@ -97,6 +106,82 @@ struct Cli {
 /// Max uint160 — used as the Permit2 approved amount (unlimited).
 fn max_uint160() -> BigUint {
     BigUint::from_bytes_be(&[0xFF; 20])
+}
+
+fn validate_quote_boundary(
+    quote_number: u64,
+    quote_hash: B256,
+    latest_number: u64,
+    canonical_hash: B256,
+    max_age: u64,
+) -> anyhow::Result<()> {
+    let age = latest_number.saturating_sub(quote_number);
+    if quote_number > latest_number {
+        bail!("quote block {quote_number} is ahead of RPC block {latest_number}");
+    }
+    if age > max_age {
+        bail!(
+            "quote is stale: block {quote_number} is {age} blocks behind latest block \
+             {latest_number} (maximum {max_age})"
+        );
+    }
+    if canonical_hash != quote_hash {
+        bail!(
+            "quote block was reorganized: expected {quote_hash:#x}, canonical hash is \
+             {canonical_hash:#x}"
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_quote_fresh(
+    provider: &RootProvider<Ethereum>,
+    quote_number: u64,
+    quote_hash: B256,
+    max_age: u64,
+) -> anyhow::Result<()> {
+    let latest_number = provider
+        .get_block_number()
+        .await
+        .context("failed to fetch latest block number")?;
+    let canonical = provider
+        .get_block_by_number(BlockNumberOrTag::Number(quote_number))
+        .await
+        .context("failed to fetch quoted block")?
+        .ok_or_else(|| anyhow::anyhow!("quoted block {quote_number} is unavailable"))?;
+    validate_quote_boundary(quote_number, quote_hash, latest_number, canonical.header.hash, max_age)
+}
+
+async fn wait_for_next_block(
+    provider: &RootProvider<Ethereum>,
+    previous: u64,
+) -> anyhow::Result<u64> {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let current = provider
+                .get_block_number()
+                .await
+                .context("failed to fetch latest block number")?;
+            if current > previous {
+                return Ok(current);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for the next block")?
+}
+
+fn ensure_minimum_received(
+    settled_amount: Option<&BigUint>,
+    minimum_received: &BigUint,
+) -> anyhow::Result<()> {
+    let settled = settled_amount
+        .ok_or_else(|| anyhow::anyhow!("simulation did not return a settled output amount"))?;
+    if settled < minimum_received {
+        bail!("simulation output {settled} is below minimum required output {minimum_received}");
+    }
+    Ok(())
 }
 
 /// Detect ERC-20 storage slots and build `StorageOverrides` for a dry-run.
@@ -411,6 +496,13 @@ async fn main() -> anyhow::Result<()> {
     let quote = client
         .quote(QuoteParams::new(order, quote_options))
         .await?;
+    let quote_block_number = quote.block().number();
+    let quote_block_hash =
+        B256::from_str(quote.block().hash()).context("quote returned an invalid block hash")?;
+    let minimum_received = quote
+        .fee_breakdown()
+        .map(|fees| fees.min_amount_received().clone())
+        .ok_or_else(|| anyhow::anyhow!("encoded quote has no minimum received amount"))?;
 
     println!("\n========== Quote ==========");
     println!("Status:              {:?}", quote.status());
@@ -426,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Token out:           0x{}", hex::encode(&buy_token_bytes));
     println!("Gas estimate:        {}", quote.gas_estimate());
     println!("Solve time:          {}ms", quote.solve_time_ms());
+    println!("Quote block:         {quote_block_number}");
     if let Some(route) = quote.route() {
         println!("Route ({} hops):", route.swaps().len());
         for (i, swap) in route.swaps().iter().enumerate() {
@@ -461,6 +554,51 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     let signed = SignedSwap::assemble(payload, order_sig);
 
+    if cli.execute {
+        ensure_quote_fresh(
+            &provider,
+            quote_block_number,
+            quote_block_hash,
+            cli.max_quote_block_age,
+        )
+        .await?;
+
+        println!("Running exact signed-transaction preflight...");
+        let preflight = client
+            .execute_swap(
+                signed.clone(),
+                &ExecutionOptions {
+                    dry_run: true,
+                    storage_overrides: None,
+                    fetch_revert_reason: true,
+                },
+            )
+            .await?
+            .await?;
+        ensure_minimum_received(preflight.settled_amount(), &minimum_received)?;
+        println!(
+            "Preflight successful: settled output {} >= minimum {}",
+            preflight
+                .settled_amount()
+                .expect("checked by ensure_minimum_received"),
+            minimum_received
+        );
+
+        // Simulation is a network round trip. Recheck both age and canonical hash immediately
+        // before broadcasting the exact payload that was simulated.
+        ensure_quote_fresh(
+            &provider,
+            quote_block_number,
+            quote_block_hash,
+            cli.max_quote_block_age,
+        )
+        .await?;
+    }
+
+    if cli.execute && cli.shadow_blocks != 1 {
+        bail!("--shadow-blocks cannot be combined with --execute");
+    }
+
     // ── Build execution options ───────────────────────────────────────────────
     let exec_options = if cli.execute {
         println!("Submitting on-chain transaction...");
@@ -482,6 +620,35 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── Execute ───────────────────────────────────────────────────────────────
+    if !cli.execute && cli.shadow_blocks > 1 {
+        let mut block = provider
+            .get_block_number()
+            .await
+            .context("failed to fetch latest block number")?;
+        println!("\n========== Shadow replay ==========");
+        for observation in 1..=cli.shadow_blocks {
+            if observation > 1 {
+                block = wait_for_next_block(&provider, block).await?;
+            }
+            let settled = client
+                .execute_swap(signed.clone(), &exec_options)
+                .await?
+                .await?;
+            let amount = settled
+                .settled_amount()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unavailable".to_owned());
+            println!(
+                "Shadow {observation}/{}: block={block} quote_age={} settled={amount} gas_wei={}",
+                cli.shadow_blocks,
+                block.saturating_sub(quote_block_number),
+                settled.gas_cost()
+            );
+        }
+        println!("===================================");
+        return Ok(());
+    }
+
     let receipt = client
         .execute_swap(signed, &exec_options)
         .await?;
@@ -544,6 +711,50 @@ mod tests {
         assert_eq!(cli.transfer_type, TransferType::TransferFrom);
         assert_eq!(cli.permit2, "0x000000000022D473030F116dDEE9F6B43aC78BA3");
         assert!(!cli.execute);
+        assert_eq!(cli.max_quote_block_age, 1);
+        assert_eq!(cli.shadow_blocks, 1);
+    }
+
+    #[test]
+    fn quote_boundary_accepts_fresh_canonical_block() {
+        let hash = B256::repeat_byte(1);
+        validate_quote_boundary(100, hash, 101, hash, 1).unwrap();
+    }
+
+    #[test]
+    fn quote_boundary_rejects_stale_block() {
+        let hash = B256::repeat_byte(1);
+        let error = validate_quote_boundary(100, hash, 102, hash, 1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("quote is stale"));
+    }
+
+    #[test]
+    fn quote_boundary_rejects_future_block() {
+        let hash = B256::repeat_byte(1);
+        let error = validate_quote_boundary(102, hash, 101, hash, 1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("ahead of RPC block"));
+    }
+
+    #[test]
+    fn quote_boundary_rejects_reorganized_block() {
+        let error =
+            validate_quote_boundary(100, B256::repeat_byte(1), 100, B256::repeat_byte(2), 1)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("quote block was reorganized"));
+    }
+
+    #[test]
+    fn minimum_received_rejects_missing_or_insufficient_output() {
+        let minimum = BigUint::from(100u8);
+        assert!(ensure_minimum_received(None, &minimum).is_err());
+        assert!(ensure_minimum_received(Some(&BigUint::from(99u8)), &minimum).is_err());
+        ensure_minimum_received(Some(&minimum), &minimum).unwrap();
     }
 
     #[test]

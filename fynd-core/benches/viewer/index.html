@@ -504,15 +504,15 @@
 <div id="boot" class="boot"></div>
 
 <footer>
-  The Orders tab reads <code>bench-results/&lt;name&gt;/routes.jsonl</code>; the Report tab derives
+  The Orders tab reads <code>artifacts/benchmarks/runs/&lt;name&gt;/routes.jsonl</code>; the Report tab derives
   its figures from <code>orders.csv</code>, so they follow the trade-size slice.
 </footer>
 
 <script>
   // ---------------------------------------------------------------------------- loading
-  // The bench writes bench-results/; this page reads it. Nothing is bundled, so a new run shows up
+  // The bench writes artifacts/benchmarks/runs/; this page reads it. Nothing is bundled, so a new run shows up
   // on refresh. Paths are relative to this file, which sits at fynd-core/benches/viewer/.
-  const ROOT = "../../../bench-results";
+  const ROOT = "../../../artifacts/benchmarks/runs";
 
   const state = {
     run: null, runs: [], facts: {}, tab: "report",
@@ -1863,7 +1863,7 @@
     } catch (error) {
       boot(`<h1>No benchmark runs found</h1>
         <p class="err">${error.message}</p>
-        <p>This page reads <code>bench-results/</code> at the repo root. Run the benchmark, then refresh:</p>
+        <p>This page reads <code>artifacts/benchmarks/runs/</code> at the repo root. Run the benchmark, then refresh:</p>
         <pre>./scripts/bench.sh --name my-run --orders 500</pre>
         <p>If a run exists but this still fails, the page is probably being opened straight from disk.
            <code>file://</code> blocks the reads it needs — serve the repo instead:</p>

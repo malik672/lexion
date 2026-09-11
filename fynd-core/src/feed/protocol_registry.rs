@@ -97,6 +97,10 @@ const BLOCKED_UNISWAP_V4_HOOKS: &[&str] = &[
 ];
 
 /// Keeps a Uniswap V4 component unless its hook is in [`BLOCKED_UNISWAP_V4_HOOKS`].
+///
+/// This is a routing/simulation availability filter, not admission to a mathematical certificate.
+/// Other nonzero hooks may still be routed through their simulator. The certified routing bounds
+/// independently reject every nonzero hook because they do not yet model arbitrary hook effects.
 fn uniswap_v4_hook_filter(component: &ComponentWithState) -> bool {
     let Some(hook) = component
         .component

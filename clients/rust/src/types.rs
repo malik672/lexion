@@ -679,7 +679,6 @@ pub struct Swap {
     amount_in: BigUint,
     amount_out: BigUint,
     gas_estimate: BigUint,
-    #[allow(dead_code)]
     split: f64,
 }
 
@@ -717,6 +716,11 @@ impl Swap {
     /// Estimated gas units required to execute this swap.
     pub fn gas_estimate(&self) -> &BigUint {
         &self.gas_estimate
+    }
+
+    /// Fraction of the parent flow assigned to this swap. Zero denotes sequential execution.
+    pub fn split(&self) -> f64 {
+        self.split
     }
 
     /// Create a new [`Swap`].

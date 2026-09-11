@@ -18,7 +18,7 @@ measurable value of adding Fynd to a venue.
 
 The on-chain subcommands take `--chain` (selects the address book) and `--registry` /
 `HINDSIGHT_REGISTRY` to load a custom address book. See `--help` per subcommand and
-[CLAUDE.md](CLAUDE.md) for environment variables. The RPC endpoint must support
+Set the required environment variables before running the tool. The RPC endpoint must support
 `debug_traceBlockByNumber`.
 
 ## Terminology: the three address tiers

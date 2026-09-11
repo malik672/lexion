@@ -169,6 +169,26 @@ Positive bps diffs mean solver B returned more output.
 
 ---
 
+## External router audit
+
+The audit command compares Fynd with external routers concurrently and can replay returned calldata
+through `eth_call` using identical artificial balances and allowances. Add 1inch by setting a
+Developer Portal API key:
+
+```bash
+ONEINCH_API_KEY=... RPC_URL=... cargo run -p fynd-benchmark --release -- audit \
+  --fynd-url http://localhost:3001 \
+  --blocks 20 \
+  --random-orders 100 \
+  --output artifacts/benchmarks/comparisons/fynd-live-20-blocks.json
+```
+
+No transaction is broadcast and the state overrides do not require real token balances. The report
+contains raw output, gas-adjusted output, latency, route availability, calldata replay output, and
+reverts for every participant.
+
+---
+
 ## Request Data
 
 By default, the load test uses a single WETH->USDC swap and the compare tool samples from a built-in set of 50 real aggregator trades. Both commands accept `--requests-file` to supply custom requests. See `requests_set.json` in this directory for the format.

@@ -17,6 +17,15 @@ pub struct Args {
     #[arg(long, env = "FYND_URL", default_value = "http://localhost:3000")]
     pub fynd_url: String,
 
+    /// Capture only the local solver; external comparisons can consume the resulting JSON.
+    #[arg(long, default_value_t = false)]
+    pub fynd_only: bool,
+
+    /// External participants to query, as a comma-separated list.
+    /// Supported values: nordstern, kyberswap, cowswap, paraswap, 0x, 1inch.
+    #[arg(long, default_value = "nordstern,kyberswap,cowswap,paraswap,0x,1inch")]
+    pub participants: String,
+
     /// Nordstern Finance base URL.
     #[arg(long, default_value = "https://api.nordstern.finance")]
     pub nordstern_url: String,
@@ -29,6 +38,18 @@ pub struct Args {
     #[arg(long, default_value = "ethereum")]
     pub kyberswap_chain: String,
 
+    /// CoW Protocol Order Book API base URL.
+    #[arg(long, default_value = "https://api.cow.fi/mainnet")]
+    pub cow_url: String,
+
+    /// ParaSwap/Velora Market API base URL.
+    #[arg(long, default_value = "https://api.paraswap.io")]
+    pub paraswap_url: String,
+
+    /// Restrict ParaSwap to these comma-separated DEX families.
+    #[arg(long)]
+    pub paraswap_dexes: Option<String>,
+
     /// 0x Swap API v2 base URL.
     #[arg(long, default_value = "https://api.0x.org")]
     pub zerox_url: String,
@@ -36,6 +57,14 @@ pub struct Args {
     /// 0x API key (env: ZRX_API_KEY).
     #[arg(long, env = "ZRX_API_KEY", default_value = "")]
     pub zerox_api_key: String,
+
+    /// 1inch Swap API base URL.
+    #[arg(long, default_value = "https://api.1inch.dev/swap/v6.1")]
+    pub oneinch_url: String,
+
+    /// 1inch Developer Portal API key (env: ONEINCH_API_KEY).
+    #[arg(long, env = "ONEINCH_API_KEY", default_value = "")]
+    pub oneinch_api_key: String,
 
     /// EVM chain ID passed to aggregator APIs (1 = Ethereum mainnet).
     #[arg(long, default_value_t = 1)]
@@ -54,6 +83,20 @@ pub struct Args {
     /// Number of representative amounts per pair (evenly-spaced percentiles).
     #[arg(long, default_value_t = 10)]
     pub amounts_per_pair: usize,
+
+    /// Number of seeded random historical orders to sample, balanced across the selected
+    /// directional pairs and small/medium/large amount terciles. Zero keeps percentile mode.
+    #[arg(long, default_value_t = 0)]
+    pub random_orders: usize,
+
+    /// Seed used by `--random-orders`.
+    #[arg(long, default_value_t = 42)]
+    pub seed: u64,
+
+    /// Exclude pairs containing native ETH. Use this for comparisons against aggregators that
+    /// accept WETH but do not support native ETH orders, such as CoW Protocol.
+    #[arg(long, default_value_t = false)]
+    pub exclude_native: bool,
 
     /// Path to the 10k aggregator trade dataset (run `download-trades` to fetch it).
     /// Falls back to the embedded 50-trade sample when omitted.

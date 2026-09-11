@@ -101,7 +101,7 @@ function uniswapLegs(uni) {
 }
 
 async function main() {
-  const runDir = process.argv[2] || 'bench-results/v2-v3-live';
+  const runDir = process.argv[2] || 'artifacts/benchmarks/runs/v2-v3-live';
   const rpcUrl = process.env.UNISWAP_RPC_URL;
   if (!rpcUrl) die('UNISWAP_RPC_URL is not set');
 

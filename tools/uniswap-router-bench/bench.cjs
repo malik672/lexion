@@ -5,12 +5,102 @@ const path = require('path');
 const { parse } = require('csv-parse/sync');
 const { ethers } = require('ethers');
 const JSBI = require('jsbi');
-const { AlphaRouter, TO_PROTOCOL } = require('@uniswap/smart-order-router');
-const { CurrencyAmount, Ether, Token, TradeType } = require('@uniswap/sdk-core');
+const { AlphaRouter, SwapType, TO_PROTOCOL } = require('@uniswap/smart-order-router');
+const { CurrencyAmount, Ether, Percent, Token, TradeType } = require('@uniswap/sdk-core');
+const { Pool } = require('@uniswap/v3-sdk');
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 const CHAIN_ID = 1;
-const HYBRID_CONFIG = 'path_frank_wolfe_d2';
+const HYBRID_CONFIG = process.env.FYND_BENCH_CONFIG || 'path_frank_wolfe_d2';
+const ORDER_FILTER = process.env.FYND_BENCH_ORDER;
+const MEASURE_ACTUAL_GAS = process.env.UNISWAP_ACTUAL_GAS === '1';
+const SIMULATION_SENDER = '0x0000000000000000000000000000000000000001';
+const ERC20 = new ethers.utils.Interface([
+  'function balanceOf(address) view returns (uint256)',
+  'function allowance(address,address) view returns (uint256)',
+]);
+const PROBE_SENTINEL = ethers.utils.hexZeroPad('0xdeadbeef', 32);
+// Keep packed high-bit token flags (for example USDC's blacklist bit) clear.
+const LARGE_TOKEN_WORD = `0x${'00'.repeat(8)}${'ff'.repeat(24)}`;
+const MAX_NATIVE_BALANCE = `0x${'ff'.repeat(32)}`;
+const OZ_V5_BALANCES_NS = '0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00';
+const OZ_V5_ALLOWANCES_NS = '0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace01';
+
+function mappingSlot(address, position) {
+  return ethers.utils.keccak256(
+    ethers.utils.defaultAbiCoder.encode(['address', 'uint256'], [address, position])
+  );
+}
+
+function nestedMappingSlot(owner, spender, position) {
+  const inner = mappingSlot(owner, position);
+  return ethers.utils.keccak256(
+    ethers.utils.defaultAbiCoder.encode(['address', 'bytes32'], [spender, inner])
+  );
+}
+
+function mappingSlotAtBase(address, base) {
+  return ethers.utils.keccak256(
+    ethers.utils.defaultAbiCoder.encode(['address', 'bytes32'], [address, base])
+  );
+}
+
+function nestedMappingSlotAtBase(owner, spender, base) {
+  const inner = mappingSlotAtBase(owner, base);
+  return ethers.utils.keccak256(
+    ethers.utils.defaultAbiCoder.encode(['address', 'bytes32'], [spender, inner])
+  );
+}
+
+async function findStorageSlot(provider, blockTag, token, calldata, slots) {
+  for (const slot of slots) {
+    const overrides = { [token]: { stateDiff: { [slot]: PROBE_SENTINEL } } };
+    const result = await provider.send('eth_call', [{ to: token, data: calldata }, blockTag, overrides]);
+    if (ethers.BigNumber.from(result).eq(PROBE_SENTINEL)) return slot;
+  }
+  throw new Error(`could not locate ERC-20 storage slot for ${token}`);
+}
+
+async function estimateActualSorGas(provider, blockNumber, tokenIn, amountIn, route) {
+  if (!route.methodParameters) throw new Error('SOR did not return executable method parameters');
+  const sender = SIMULATION_SENDER;
+  const spender = route.methodParameters.to;
+  const blockTag = ethers.utils.hexValue(blockNumber);
+  const balanceCall = ERC20.encodeFunctionData('balanceOf', [sender]);
+  const allowanceCall = ERC20.encodeFunctionData('allowance', [sender, spender]);
+  const balanceSlot = await findStorageSlot(
+    provider,
+    blockTag,
+    tokenIn.address,
+    balanceCall,
+    [...Array(21).keys()].map((position) => mappingSlot(sender, position)).concat(
+      mappingSlotAtBase(sender, OZ_V5_BALANCES_NS)
+    )
+  );
+  const allowanceSlot = await findStorageSlot(
+    provider,
+    blockTag,
+    tokenIn.address,
+    allowanceCall,
+    [...Array(21).keys()].map((position) => nestedMappingSlot(sender, spender, position)).concat(
+      nestedMappingSlotAtBase(sender, spender, OZ_V5_ALLOWANCES_NS)
+    )
+  );
+  const overrides = {
+    [sender]: { balance: MAX_NATIVE_BALANCE },
+    [tokenIn.address]: {
+      stateDiff: { [balanceSlot]: LARGE_TOKEN_WORD, [allowanceSlot]: LARGE_TOKEN_WORD },
+    },
+  };
+  const transaction = {
+    from: sender,
+    to: spender,
+    data: route.methodParameters.calldata,
+    value: route.methodParameters.value,
+  };
+  const result = await provider.send('eth_estimateGas', [transaction, blockTag, overrides]);
+  return BigInt(result);
+}
 
 function die(message) {
   console.error(`error: ${message}`);
@@ -123,6 +213,30 @@ function uniswapRouteSummary(route) {
     .join('|');
 }
 
+function uniswapRouteDetails(route) {
+  if (!route || !Array.isArray(route.route)) return [];
+  return route.route.map((entry) => ({
+    percent: entry.percent == null ? null : entry.percent,
+    protocol: protocolLabel(entry),
+    pools: Array.isArray(entry.route && entry.route.pools)
+      ? entry.route.pools.map((pool) => ({
+          address:
+            pool.address ||
+            pool.liquidityToken?.address ||
+            (pool.token0 && pool.token1 && pool.fee != null
+              ? Pool.getAddress(pool.token0, pool.token1, pool.fee)
+              : null),
+          token0: pool.token0?.address || null,
+          token1: pool.token1?.address || null,
+          fee: pool.fee == null ? null : pool.fee,
+        }))
+      : [],
+    token_path: Array.isArray(entry.route && entry.route.tokenPath)
+      ? entry.route.tokenPath.map((token) => token.address || 'ETH')
+      : [],
+  }));
+}
+
 function fyndRouteSummary(route) {
   if (!route || !Array.isArray(route.edges)) return '';
   return route.edges
@@ -190,7 +304,7 @@ function bump(score, outcome) {
 
 async function main() {
   const runDir = process.argv[2];
-  if (!runDir) die('usage: node bench.cjs <bench-results/run-dir>');
+  if (!runDir) die('usage: node bench.cjs <artifacts/benchmarks/runs/run-dir>');
   const rpcUrl = process.env.UNISWAP_RPC_URL || process.env.RPC_URL;
   if (!rpcUrl) die('UNISWAP_RPC_URL/RPC_URL is not set');
 
@@ -200,12 +314,21 @@ async function main() {
   const tokenPath = path.resolve(__dirname, '../../fynd-core/benches/tokens.json');
   const metadata = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
   const rows = parse(fs.readFileSync(ordersPath, 'utf8'), { columns: true, skip_empty_lines: true });
-  const hybridRows = rows.filter((row) => row.config === HYBRID_CONFIG && row.solved === 'true');
+  const hybridRows = rows.filter(
+    (row) =>
+      row.config === HYBRID_CONFIG &&
+      row.solved === 'true' &&
+      (!ORDER_FILTER || row.order === ORDER_FILTER)
+  );
   if (!hybridRows.length) die(`no solved ${HYBRID_CONFIG} rows in ${ordersPath}`);
 
   const fyndRoutes = loadFyndRoutes(runDir);
   const context = parseRunContext(runDir);
   const provider = new ethers.providers.JsonRpcProvider(rpcUrl, CHAIN_ID);
+  const simulationProvider = new ethers.providers.JsonRpcProvider(
+    process.env.ACTUAL_GAS_RPC_URL || rpcUrl,
+    CHAIN_ID
+  );
   const gasPriceProvider = {
     async getGasPrice() {
       return { gasPriceWei: context.gasPriceWei };
@@ -247,7 +370,16 @@ async function main() {
     }
 
     try {
-      const uni = await router.route(amount, tokenOut, TradeType.EXACT_INPUT, undefined, {
+      const block = await provider.getBlock(context.blockNumber);
+      const swapConfig = MEASURE_ACTUAL_GAS
+        ? {
+            type: SwapType.SWAP_ROUTER_02,
+            recipient: SIMULATION_SENDER,
+            slippageTolerance: new Percent(50, 10_000),
+            deadline: block.timestamp + 1_200,
+          }
+        : undefined;
+      const uni = await router.route(amount, tokenOut, TradeType.EXACT_INPUT, swapConfig, {
         blockNumber: context.blockNumber,
         protocols,
         maxSwapsPerPath: 2,
@@ -273,6 +405,15 @@ async function main() {
       const uniGross = BigInt(uni.quote.quotient.toString());
       const uniNet = BigInt(uni.quoteGasAdjusted.quotient.toString());
       const uniGasUnits = BigInt(uni.estimatedGasUsed.toString());
+      const uniActualGasUnits = MEASURE_ACTUAL_GAS
+        ? await estimateActualSorGas(
+            simulationProvider,
+            context.blockNumber,
+            tokenIn,
+            amount.quotient.toString(),
+            uni
+          )
+        : null;
       const uniGasCostQuote = uniGross - uniNet;
 
       const grossWinner = winner(fyndGross, uniGross);
@@ -307,9 +448,11 @@ async function main() {
         uniswap_gross: uniGross.toString(),
         uniswap_net: uniNet.toString(),
         uniswap_gas_units: uniGasUnits.toString(),
+        uniswap_actual_gas_units: uniActualGasUnits == null ? null : uniActualGasUnits.toString(),
         uniswap_gas_cost_quote_raw: uniGasCostQuote.toString(),
         uniswap_gas_price_wei: context.gasPriceWei.toString(),
         uniswap_route: uniswapRouteSummary(uni),
+        uniswap_route_details: uniswapRouteDetails(uni),
         gross_delta_fynd_minus_uniswap: grossDelta.toString(),
         net_delta_fynd_minus_uniswap: netDelta.toString(),
         gas_cost_delta_fynd_minus_uniswap_quote_raw: gasCostDelta.toString(),

@@ -1,8 +1,8 @@
-# Hybrid V2/V3 Router
+# Lexion
 
-This is a runnable Rust workspace for a hybrid DEX-routing algorithm. It uses Fynd's market ingestion and pool simulators as infrastructure, while the routing decision is extended with our exact-replay V2/V3 refinement.
+Lexion is a hybrid DEX-routing system built on Fynd's market ingestion, graph, and pool-simulation infrastructure. Its routing layer adds resource-aware quotient search, exact integer replay, certified allocation bounds, and the experimental Sacred Timeline cutoff.
 
-The hybrid begins from Fynd's native Path Frank-Wolfe route, searches a bounded family of compatible disjoint V2, V3, and mixed V2/V3 paths, exactly simulates each candidate allocation, and returns a hybrid route only when its gas-adjusted integer output is strictly better than the native result.
+Lexion begins from Fynd's native Path Frank-Wolfe route, searches a bounded family of compatible disjoint V2, V3, V4, and mixed paths, exactly simulates each candidate allocation, and returns a hybrid route only when its gas-adjusted integer output is strictly better than the native result.
 
 ## Core invariant
 
@@ -43,6 +43,16 @@ The bounded hybrid is also the experimental base for a deeper exact-routing desi
 
 The design and its correctness obligations are documented in [`docs/canonical-flow-dag-search.md`](docs/canonical-flow-dag-search.md). It is research work, not a claim about the current production path.
 
+The implemented pool-disjoint scheduling model, quotient proofs, related-work boundary, and
+quotient-versus-exhaustive measurements are documented in
+[`docs/routing-scheduling-formalization.md`](docs/routing-scheduling-formalization.md).
+
+The implemented hybrid's method, acceptance rule, and limits are summarized in
+[`docs/hybrid-algorithm.md`](docs/hybrid-algorithm.md).
+
+The remaining proof, benchmarking, baseline, and production work is tracked in
+[`REMAIN.md`](REMAIN.md).
+
 ## Attribution
 
-This workspace is based on [Fynd](https://github.com/propeller-heads/fynd), whose simulator and market graph make exact route replay possible. Tycho is an infrastructure dependency used for live market data; it is not the algorithm described here.
+Lexion is based on [Fynd](https://github.com/propeller-heads/fynd), whose ingestion, simulator, and market graph make exact route replay possible. Existing `fynd-*` crate names and APIs are retained for upstream compatibility; they do not name Lexion's routing contribution. Tycho supplies live market data and is not the routing algorithm described here.

@@ -1,0 +1,2 @@
+algorithm = "path_frank_wolfe_multiscale_cutoff_001bps"
+max_hops = 2

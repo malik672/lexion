@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Serve the benchmark result viewer.
 #
-# The viewer is a single static page that reads bench-results/ over HTTP. It has no build step and
+# The viewer is a single static page that reads artifacts/benchmarks/runs/ over HTTP. It has no build step and
 # no dependencies -- this script only exists because browsers refuse the reads it needs when a page
 # is opened straight from disk with file://.
 #
@@ -37,8 +37,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! -d bench-results ]]; then
-  echo "note: no bench-results/ yet — the viewer will say so until a run exists." >&2
+if [[ ! -d artifacts/benchmarks/runs ]]; then
+  echo "note: no benchmark runs yet — the viewer will say so until a run exists." >&2
   echo "      ./scripts/bench.sh --name my-run --orders 500" >&2
 fi
 

@@ -1,13 +1,10 @@
 # Table of contents
 
-* [GitHub](https://github.com/propeller-heads/fynd)
-* [Contact us](https://t.me/+B4CNQwv7dgIyYTJl)
-
 ## Get Started
 
 * [Overview](README.md)
 * [Quickstart](get-started/quickstart/README.md)
-* [Hosted Fynd API](get-started/hosted-api.md)
+* [Hosted API](get-started/hosted-api.md)
 
 ## Guides
 
@@ -15,7 +12,7 @@
 * [Encoding Options](guides/encoding-options.md)
 * [Swap CLI](guides/swap-cli.md)
 * [Price Guard](guides/price-guard.md)
-* [Fynd Fees](guides/router-fees.md)
+* [Router Fees](guides/router-fees.md)
 * [Charge Fees on your Swaps](guides/client-fees.md)
 * [Benchmarking](guides/benchmarking.md)
 * [Custom Algorithm](guides/custom-algorithm.md)
@@ -27,6 +24,16 @@
 * [Bellman-Ford](algorithms/bellman-ford.md)
 * [Path Frank-Wolfe](algorithms/path-frank-wolfe.md)
 * [Water-fill](algorithms/water-fill.md)
+* [Lexion Hybrid](hybrid-algorithm.md)
+
+## Research
+
+* [Routing formalization](routing-scheduling-formalization.md)
+* [Novelty audit](routing-novelty-audit.md)
+* [Canonical flow-DAG search](canonical-flow-dag-search.md)
+* [V3 allocation formalization](v3-allocation-formalization.md)
+* [V2 rounding certificate](research/v2-rounding-certificate.md)
+* [Versioned market publication](versioned-market-publication.md)
 
 ## Reference
 
@@ -40,7 +47,3 @@
 * [fynd-core](https://docs.rs/fynd-core)
 * [fynd-rpc](https://docs.rs/fynd-rpc)
 * [fynd-rpc-types](https://docs.rs/fynd-rpc-types)
-
-## MEDIA KIT
-
-* [Brand Assets](https://drive.google.com/drive/folders/1AZzrF_3r9lVMRUZJbNNNaPiDM7GJ4ySc?usp=sharing)

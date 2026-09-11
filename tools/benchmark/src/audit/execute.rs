@@ -89,6 +89,12 @@ pub(crate) async fn execute_trade(
         })
         .collect();
 
+    let size_bucket = task
+        .pair
+        .size_buckets
+        .get(task.amount_percentile_idx)
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
     Ok(TradeResult {
         block_sample: task.block_sample,
         block_hash: quote_block.map(|h| format!("0x{}", hex::encode(h.as_slice()))),
@@ -97,6 +103,7 @@ pub(crate) async fn execute_trade(
         token_out: task.pair.token_out,
         amount_in: task.amount,
         amount_percentile_idx: task.amount_percentile_idx,
+        size_bucket,
         participants: participants_out,
     })
 }
@@ -236,6 +243,7 @@ fn build_participant_result(
             route: q.route,
             num_splits: q.num_splits,
             response_time_ms: Some(q.response_time_ms),
+            calldata: q.calldata,
             eth_call_amount_out: ec_amount,
             eth_call_diff_bps: ec_diff,
             eth_call_gas_used: ec_gas,
@@ -255,6 +263,7 @@ fn build_participant_result(
                 route: None,
                 num_splits: None,
                 response_time_ms: None,
+                calldata: None,
                 eth_call_amount_out: None,
                 eth_call_diff_bps: None,
                 eth_call_gas_used: None,
@@ -321,24 +330,58 @@ fn compute_diffs(
     let net_gas = baseline.net_gas.as_ref();
 
     let raw = raw_bps_diff(&baseline.amount, &other_raw);
-    let gas_reported = gas_adjusted_bps_diff(
-        &baseline.amount,
+    let gas_reported = if let (Some(baseline_net), Some(other_net)) = (
         net_gas,
-        baseline.gas_units,
-        &other_raw,
-        q.gas_units.unwrap_or(0),
-    );
-    let gas_onchain = match (baseline.ec_fee_adj.as_ref(), ec_amount.and_then(parse_amount)) {
-        (Some(ec_fee_adj), Some(ec_amount)) => gas_adjusted_bps_diff(
-            ec_fee_adj,
+        q.amount_out_net_gas
+            .as_deref()
+            .and_then(parse_amount),
+    ) {
+        raw_bps_diff(baseline_net, &other_net)
+    } else {
+        gas_adjusted_bps_diff(
+            &baseline.amount,
             net_gas,
-            baseline.eth_call_gas.unwrap_or(0),
-            &ec_amount,
-            ec_gas.unwrap_or(0),
-        ),
-        _ => None,
+            baseline.gas_units,
+            &other_raw,
+            q.gas_units.unwrap_or(0),
+        )
+    };
+    let gas_onchain = if let (Some(baseline_actual), Some(other_net)) = (
+        baseline_actual_net(baseline),
+        q.amount_out_net_gas
+            .as_deref()
+            .and_then(parse_amount),
+    ) {
+        raw_bps_diff(&baseline_actual, &other_net)
+    } else {
+        match (baseline.ec_fee_adj.as_ref(), ec_amount.and_then(parse_amount)) {
+            (Some(ec_fee_adj), Some(ec_amount)) => gas_adjusted_bps_diff(
+                ec_fee_adj,
+                net_gas,
+                baseline.eth_call_gas.unwrap_or(0),
+                &ec_amount,
+                ec_gas.unwrap_or(0),
+            ),
+            _ => None,
+        }
     };
     (raw, gas_reported, gas_onchain)
+}
+
+/// Compute Fynd's replayed output after scaling its quoted output-denominated gas cost by the
+/// actual gas consumed during replay.
+fn baseline_actual_net(baseline: &Baseline) -> Option<BigUint> {
+    let actual_output = baseline.ec_fee_adj.as_ref()?;
+    let estimated_net = baseline.net_gas.as_ref()?;
+    if baseline.gas_units == 0 {
+        return None;
+    }
+    if baseline.amount < *estimated_net {
+        return None;
+    }
+    let estimated_cost = &baseline.amount - estimated_net;
+    let actual_cost = estimated_cost * baseline.eth_call_gas? / baseline.gas_units;
+    (actual_output >= &actual_cost).then(|| actual_output - actual_cost)
 }
 
 /// Decode a 0x-prefixed hex string into a 20-byte `Address`, returning `None` on any error.
@@ -407,5 +450,31 @@ async fn run_eth_call_for_calldata(
             warn!("eth_call validation failed: {e}");
             (None, None, None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn baseline(actual_gas: Option<u64>) -> Baseline {
+        Baseline {
+            amount: BigUint::from(10_000u64),
+            net_gas: Some(BigUint::from(9_900u64)),
+            gas_units: 100,
+            eth_call_gas: actual_gas,
+            ec_fee_adj: Some(BigUint::from(10_010u64)),
+            ok: true,
+        }
+    }
+
+    #[test]
+    fn actual_net_scales_quoted_cost_by_replayed_gas() {
+        assert_eq!(baseline_actual_net(&baseline(Some(120))), Some(BigUint::from(9_890u64)));
+    }
+
+    #[test]
+    fn actual_net_requires_replayed_gas() {
+        assert_eq!(baseline_actual_net(&baseline(None)), None);
     }
 }

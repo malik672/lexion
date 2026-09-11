@@ -23,12 +23,15 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::{info, warn};
 
 use crate::{
-    aggregator::{KyberswapClient, NordsternClient, ZeroExClient},
+    aggregator::{
+        CowSwapClient, KyberswapClient, NordsternClient, OneInchClient, ParaswapClient,
+        ZeroExClient,
+    },
     audit::{
         execute::{execute_trade, QuoteTask, TradeConfig},
         output::{AuditConfig, AuditOutput, TradeResult},
     },
-    pair_selector::{select_top_pairs, PairSpec},
+    pair_selector::{select_random_stratified_orders, select_top_pairs, PairSpec},
     requests::{load_all_embedded_templates, load_all_templates_from_file},
 };
 
@@ -83,7 +86,7 @@ pub async fn run(args: Args) -> Result<()> {
 
 /// Load the trade dataset and derive the top token pairs (with representative amounts).
 fn load_pairs(args: &Args) -> Result<Vec<PairSpec>> {
-    let trades = match &args.trade_data {
+    let mut trades = match &args.trade_data {
         Some(path) => load_all_templates_from_file(path)
             .map_err(|e| anyhow::anyhow!("failed to load trade data from {path}: {e}"))?,
         None => {
@@ -94,9 +97,29 @@ fn load_pairs(args: &Args) -> Result<Vec<PairSpec>> {
             load_all_embedded_templates()
         }
     };
+    if args.exclude_native {
+        const NATIVE_ETH: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        trades.retain(|trade| {
+            !trade
+                .token_in_addr()
+                .eq_ignore_ascii_case(NATIVE_ETH) &&
+                !trade
+                    .token_out_addr()
+                    .eq_ignore_ascii_case(NATIVE_ETH)
+        });
+    }
 
-    let pairs =
-        select_top_pairs(&trades, args.top_pairs, args.amounts_per_pair, args.min_amount_usd);
+    let pairs = if args.random_orders > 0 {
+        select_random_stratified_orders(
+            &trades,
+            args.top_pairs,
+            args.random_orders,
+            args.seed,
+            args.min_amount_usd,
+        )
+    } else {
+        select_top_pairs(&trades, args.top_pairs, args.amounts_per_pair, args.min_amount_usd)
+    };
     if pairs.is_empty() {
         anyhow::bail!("no valid pairs found in trade dataset");
     }
@@ -154,13 +177,44 @@ fn build_participants(
 ) -> Result<Vec<Arc<dyn AggregatorClient>>> {
     let mut participants: Vec<Arc<dyn AggregatorClient>> =
         vec![Arc::new(FyndAggregator::new(fynd, args.timeout_ms, slippage))];
-    participants.push(Arc::new(NordsternClient::new(&args.nordstern_url, args.chain_id)?));
-    participants.push(Arc::new(KyberswapClient::new(&args.kyberswap_url, &args.kyberswap_chain)?));
-    if !args.zerox_api_key.is_empty() {
+    if args.fynd_only {
+        return Ok(participants);
+    }
+    let selected = args
+        .participants
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    if selected.contains("nordstern") {
+        participants.push(Arc::new(NordsternClient::new(&args.nordstern_url, args.chain_id)?));
+    }
+    if selected.contains("kyberswap") {
+        participants
+            .push(Arc::new(KyberswapClient::new(&args.kyberswap_url, &args.kyberswap_chain)?));
+    }
+    if selected.contains("cowswap") {
+        participants.push(Arc::new(CowSwapClient::new(&args.cow_url)?));
+    }
+    if selected.contains("paraswap") {
+        participants.push(Arc::new(ParaswapClient::new(
+            &args.paraswap_url,
+            args.chain_id,
+            args.paraswap_dexes.clone(),
+        )?));
+    }
+    if selected.contains("0x") && !args.zerox_api_key.is_empty() {
         participants.push(Arc::new(ZeroExClient::new(
             &args.zerox_url,
             args.chain_id,
             &args.zerox_api_key,
+        )?));
+    }
+    if selected.contains("1inch") && !args.oneinch_api_key.is_empty() {
+        participants.push(Arc::new(OneInchClient::new(
+            &args.oneinch_url,
+            args.chain_id,
+            &args.oneinch_api_key,
         )?));
     }
     Ok(participants)
@@ -196,6 +250,10 @@ fn build_output(
         config: AuditConfig {
             fynd_url: args.fynd_url.clone(),
             nordstern_url: args.nordstern_url.clone(),
+            cow_url: args.cow_url.clone(),
+            paraswap_url: args.paraswap_url.clone(),
+            paraswap_dexes: args.paraswap_dexes.clone(),
+            oneinch_url: args.oneinch_url.clone(),
             chain_id: args.chain_id,
             top_pairs: args.top_pairs,
             amounts_per_pair: args.amounts_per_pair,
@@ -203,6 +261,9 @@ fn build_output(
             trades_per_block: chunk_size,
             block_stride: args.block_stride,
             total_trades: results.len(),
+            sampling_mode: if args.random_orders > 0 { "random_stratified" } else { "percentile" },
+            seed: (args.random_orders > 0).then_some(args.seed),
+            exclude_native: args.exclude_native,
         },
         results,
     }

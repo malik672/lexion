@@ -55,6 +55,10 @@ pub struct AuditRow {
     /// Comma-joined list of protocol identifiers used by the route, in order.
     /// E.g. `"uniswap_v3,vm:balancer_v2"`. None when no route was returned.
     pub protocols: Option<String>,
+    /// Whether the route uses split execution.
+    pub is_split: Option<bool>,
+    /// Compact symbolic signature of the encoded route topology.
+    pub topology_signature: Option<String>,
 }
 
 #[cfg(test)]

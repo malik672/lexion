@@ -337,6 +337,9 @@ pub fn write_markdown(
         })?;
     }
 
+    writeln!(&mut out, "\n## By symbolic topology signature")?;
+    write_breakdown(&mut out, &successes, |r| r.topology_signature.clone())?;
+
     writeln!(&mut out, "\n## Interpretation")?;
     writeln!(
         &mut out,
@@ -369,6 +372,8 @@ mod tests {
             error_reason: None,
             num_swaps: None,
             protocols: None,
+            is_split: None,
+            topology_signature: None,
         }
     }
 

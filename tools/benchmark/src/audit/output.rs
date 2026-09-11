@@ -12,6 +12,10 @@ pub(crate) struct AuditOutput {
 pub(crate) struct AuditConfig {
     pub(crate) fynd_url: String,
     pub(crate) nordstern_url: String,
+    pub(crate) cow_url: String,
+    pub(crate) paraswap_url: String,
+    pub(crate) paraswap_dexes: Option<String>,
+    pub(crate) oneinch_url: String,
     pub(crate) chain_id: u64,
     pub(crate) top_pairs: usize,
     pub(crate) amounts_per_pair: usize,
@@ -19,18 +23,21 @@ pub(crate) struct AuditConfig {
     pub(crate) trades_per_block: usize,
     pub(crate) block_stride: usize,
     pub(crate) total_trades: usize,
+    pub(crate) sampling_mode: &'static str,
+    pub(crate) seed: Option<u64>,
+    pub(crate) exclude_native: bool,
 }
 
 /// Per-participant result — identical shape for Fynd and every external aggregator.
 ///
 /// The first entry in `TradeResult::participants` is always `"fynd"` (the baseline).
-/// `amount_out_net_gas` is populated only by Fynd; all other aggregators leave it `null`.
+/// `amount_out_net_gas` is populated when the participant exposes an all-in user output.
 #[derive(Serialize)]
 pub(crate) struct ParticipantResult {
     pub(crate) name: String,
     pub(crate) status: String,
     pub(crate) amount_out: Option<String>,
-    /// Net-of-gas output estimate (Fynd only; aggregators set this to `null`).
+    /// Net-of-user-paid-execution-cost output estimate.
     pub(crate) amount_out_net_gas: Option<String>,
     /// Reported gas units (Fynd `gas_estimate` or aggregator self-reported gas).
     pub(crate) gas_units: Option<u64>,
@@ -41,6 +48,8 @@ pub(crate) struct ParticipantResult {
     pub(crate) num_splits: Option<usize>,
     /// Wall-clock time from request dispatch to first byte of response.
     pub(crate) response_time_ms: Option<u64>,
+    /// Encoded transaction used for pinned-block execution and gas normalization.
+    pub(crate) calldata: Option<fynd_tools_common::aggregator::AggregatorCalldata>,
     /// Amount of `token_out` returned by `eth_call` at the quote block.
     pub(crate) eth_call_amount_out: Option<String>,
     /// Difference between `eth_call_amount_out` and `amount_out` in bps.
@@ -66,6 +75,8 @@ pub(crate) struct TradeResult {
     pub(crate) amount_in: String,
     /// Index into the percentile array (0 = min, amounts_per_pair-1 = max traded amount).
     pub(crate) amount_percentile_idx: usize,
+    /// Pair-relative historical amount tercile.
+    pub(crate) size_bucket: String,
     /// All participants: first entry is `"fynd"`, remainder are aggregators.
     pub(crate) participants: Vec<ParticipantResult>,
 }

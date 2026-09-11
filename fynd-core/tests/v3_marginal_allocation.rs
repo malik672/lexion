@@ -58,7 +58,10 @@ fn terminal_marginal(
     let result = pool
         .get_amount_out(BigUint::from(amount), token_in, token_out)
         .unwrap();
-    result.new_state.spot_price(token_in, token_out).unwrap()
+    result
+        .new_state
+        .spot_price(token_in, token_out)
+        .unwrap()
 }
 
 fn exhaustive(
@@ -70,8 +73,8 @@ fn exhaustive(
 ) -> (u64, BigUint) {
     (0..=total)
         .map(|x| {
-            let output = quote(left, x, token_in, token_out)
-                + quote(right, total - x, token_in, token_out);
+            let output =
+                quote(left, x, token_in, token_out) + quote(right, total - x, token_in, token_out);
             (x, output)
         })
         .max_by(|(_, a), (_, b)| a.cmp(b))
@@ -111,8 +114,8 @@ fn marginal_search(
     (start..=end)
         .chain([0, total])
         .map(|x| {
-            let output = quote(left, x, token_in, token_out)
-                + quote(right, total - x, token_in, token_out);
+            let output =
+                quote(left, x, token_in, token_out) + quote(right, total - x, token_in, token_out);
             (x, output)
         })
         .max_by(|(_, a), (_, b)| a.cmp(b))

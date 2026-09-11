@@ -17,7 +17,7 @@ use crate::{error::FyndError, Quote};
 ///
 /// Obtain one via [`FyndClient::swap_payload`](crate::FyndClient::swap_payload) when
 /// the quote's backend is [`BackendKind::Fynd`](crate::BackendKind::Fynd).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FyndPayload {
     quote: Quote,
     tx: TypedTransaction,
@@ -47,7 +47,7 @@ impl FyndPayload {
 }
 
 /// Turbine payload stub. Fields are `()` placeholders until the Turbine signing story lands.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TurbinePayload {
     #[allow(dead_code)]
     // Placeholder: will be populated in the Turbine signing story
@@ -61,7 +61,7 @@ pub struct TurbinePayload {
 ///
 /// Only the [`Fynd`](Self::Fynd) variant is currently executable; calling methods on the
 /// [`Turbine`](Self::Turbine) variant will panic with `unimplemented!`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SwapPayload {
     /// Fynd execution path — an EIP-1559 transaction targeting the RouterV3 contract.
     Fynd(Box<FyndPayload>),
@@ -132,6 +132,7 @@ impl SwapPayload {
 /// Construct via [`SignedSwap::assemble`] after signing the
 /// [`signing_hash`](SwapPayload::signing_hash). Pass to
 /// [`FyndClient::execute_swap`](crate::FyndClient::execute_swap) to broadcast and settle.
+#[derive(Clone)]
 pub struct SignedSwap {
     payload: SwapPayload,
     signature: Signature,

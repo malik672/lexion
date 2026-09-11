@@ -55,7 +55,8 @@ using `--no-record`.
 ./scripts/bench.sh --name my-run --orders 2000
 ```
 
-That solves 2000 orders with every config and writes `bench-results/my-run/`.
+That solves 2000 orders with every config and writes
+`artifacts/benchmarks/runs/my-run/`.
 
 Useful options:
 
@@ -247,6 +248,26 @@ max_hops = 4
 
 The file is a flat table of `PoolConfig` fields. Only `algorithm` is required. See
 `configs/README.md` for which fields the run overrides.
+
+### Measure the hybrid stages
+
+Run the cumulative ablation with identical inputs:
+
+```bash
+./scripts/ablate-hybrid.sh --name hybrid-ablation --orders 2000 --jobs 1
+```
+
+The five rungs are native Path Frank-Wolfe, local exact reallocation, independent exact portfolio
+search, multi-scale candidate discovery, and V4 resource-frontier quotienting. Compare adjacent
+rungs to attribute a gain to a stage; `bellman_ford_d2` remains the report's common external
+baseline.
+
+To isolate V4 resource quotienting from the other stages, compare it with exhaustive compatible
+subset enumeration:
+
+```bash
+./scripts/compare-v4-quotient.sh --name v4-quotient --orders 2000 --jobs 1
+```
 
 ### Add an algorithm
 

@@ -12,7 +12,7 @@ if [[ -f "$REPO_ROOT/.env" ]]; then
   set +a
 fi
 
-RUN_DIR="${1:-bench-results/v2-v3-live}"
+RUN_DIR="${1:-artifacts/benchmarks/runs/v2-v3-live}"
 TOOL_DIR="$REPO_ROOT/tools/uniswap-router-bench"
 DEPS_STAMP="$TOOL_DIR/.deps-version"
 EXPECTED_DEPS="sor-4.31.10-release-graph-v1"

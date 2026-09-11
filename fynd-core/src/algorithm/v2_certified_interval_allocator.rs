@@ -37,10 +37,7 @@ impl Fraction {
     }
 
     fn add(&self, other: &Self) -> Self {
-        Self {
-            num: &self.num * &other.den + &other.num * &self.den,
-            den: &self.den * &other.den,
-        }
+        Self { num: &self.num * &other.den + &other.num * &self.den, den: &self.den * &other.den }
     }
 
     fn mul_uint(&self, x: &BigUint) -> Self {
@@ -108,7 +105,10 @@ fn curve(path: &PathAllocation, market: &MarketState) -> Option<Curve> {
 }
 
 fn descriptors(path: &PathAllocation) -> Vec<HopDescriptor> {
-    path.hops.iter().map(|hop| hop.descriptor.clone()).collect()
+    path.hops
+        .iter()
+        .map(|hop| hop.descriptor.clone())
+        .collect()
 }
 
 fn replay_one(
@@ -137,7 +137,11 @@ fn replay_one(
     replayed.amount_in = amount.clone();
     replayed.amount_out = sim.amount_out;
     replayed.marginal_price_product = sim.marginal_price_product;
-    for (hop, (amount_out, gas)) in replayed.hops.iter_mut().zip(sim.hop_results) {
+    for (hop, (amount_out, gas)) in replayed
+        .hops
+        .iter_mut()
+        .zip(sim.hop_results)
+    {
         hop.amount_out = amount_out;
         hop.gas = gas;
     }
@@ -159,13 +163,17 @@ fn exact_output(
         BigUint::zero()
     } else {
         *replays += 1;
-        replay_one(&current[0], &left_amount, total, market).ok()?.amount_out
+        replay_one(&current[0], &left_amount, total, market)
+            .ok()?
+            .amount_out
     };
     let right = if x.is_zero() {
         BigUint::zero()
     } else {
         *replays += 1;
-        replay_one(&current[1], x, total, market).ok()?.amount_out
+        replay_one(&current[1], x, total, market)
+            .ok()?
+            .amount_out
     };
     Some(left + right)
 }
@@ -194,23 +202,23 @@ fn interval_upper(
     }
     let mid = (lo + hi) / BigUint::from(2u8);
     let left_amount = total - &mid;
-    let value = left.value(&left_amount)?.add(&right.value(&mid)?);
+    let value = left
+        .value(&left_amount)?
+        .add(&right.value(&mid)?);
     let ld = left.derivative(&left_amount)?;
     let rd = right.derivative(&mid)?;
     let nonnegative = &rd.num * &ld.den >= &ld.num * &rd.den;
     let slope = if nonnegative {
-        Fraction::new(
-            &rd.num * &ld.den - &ld.num * &rd.den,
-            &rd.den * &ld.den,
-        )?
+        Fraction::new(&rd.num * &ld.den - &ld.num * &rd.den, &rd.den * &ld.den)?
     } else {
-        Fraction::new(
-            &ld.num * &rd.den - &rd.num * &ld.den,
-            &rd.den * &ld.den,
-        )?
+        Fraction::new(&ld.num * &rd.den - &rd.num * &ld.den, &rd.den * &ld.den)?
     };
     let distance = if nonnegative { hi - &mid } else { &mid - lo };
-    Some(value.add(&slope.mul_uint(&distance)).ceil())
+    Some(
+        value
+            .add(&slope.mul_uint(&distance))
+            .ceil(),
+    )
 }
 
 #[derive(Default)]
@@ -266,17 +274,7 @@ fn collect_survivors(
         stats,
         leaves,
     );
-    collect_survivors(
-        left,
-        right,
-        total,
-        incumbent,
-        mid,
-        hi,
-        depth + 1,
-        stats,
-        leaves,
-    );
+    collect_survivors(left, right, total, incumbent, mid, hi, depth + 1, stats, leaves);
 }
 
 fn stationary_point(
@@ -350,12 +348,10 @@ fn search_best_x(
     let mut stats = Stats::default();
     let left_single = exact_output(current, total, &BigUint::zero(), market, &mut stats.replays)?;
     let right_single = exact_output(current, total, total, market, &mut stats.replays)?;
-    let mut best = left_single.clone().max(right_single.clone());
-    let mut best_x = if right_single >= left_single {
-        total.clone()
-    } else {
-        BigUint::zero()
-    };
+    let mut best = left_single
+        .clone()
+        .max(right_single.clone());
+    let mut best_x = if right_single >= left_single { total.clone() } else { BigUint::zero() };
 
     // Seed the incumbent around the global continuous stationary point before
     // branching. This keeps the proof unchanged while making the tangent bounds
@@ -490,10 +486,8 @@ pub(super) fn shadow_compare_descriptors(
     total: &BigUint,
     market: &MarketState,
 ) -> Result<(), AlgorithmError> {
-    let current = vec![
-        build_full_path(left, total, market)?,
-        build_full_path(right, total, market)?,
-    ];
+    let current =
+        vec![build_full_path(left, total, market)?, build_full_path(right, total, market)?];
     let Some(baseline) = super::allocate_uniswap_v2_paths(&current, total, market)? else {
         return Ok(());
     };

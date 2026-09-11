@@ -15,7 +15,7 @@ SIZE_MULTIPLIERS="${SIZE_MULTIPLIERS:-0.01,0.1,1,10,100,1000}"
 STALE_DELAYS_MS="${STALE_DELAYS_MS:-0,2000,10000}"
 SKIP_OFFLINE="${SKIP_OFFLINE:-0}"
 CAMPAIGN="${CAMPAIGN_NAME:-exact-v2-campaign-$(date +%Y%m%d-%H%M%S)}"
-CAMPAIGN_DIR="bench-results/$CAMPAIGN"
+CAMPAIGN_DIR="artifacts/benchmarks/runs/$CAMPAIGN"
 mkdir -p "$CAMPAIGN_DIR"
 
 echo "Campaign: $CAMPAIGN"
@@ -100,7 +100,7 @@ native_name = "path_frank_wolfe_native_d2"
 hybrid_name = "path_frank_wolfe_d2"
 wins = ties = losses = native_only = hybrid_only = 0
 native_times, hybrid_times = [], []
-for path in sorted(glob.glob(f"bench-results/{campaign}-*/orders.csv")):
+for path in sorted(glob.glob(f"artifacts/benchmarks/runs/{campaign}-*/orders.csv")):
     rows = {}
     with open(path, newline="") as file:
         for row in csv.DictReader(file):
@@ -126,7 +126,7 @@ for path in sorted(glob.glob(f"bench-results/{campaign}-*/orders.csv")):
             hybrid_only += 1
 
 lines = [
-    f"runs: {len(glob.glob(f'bench-results/{campaign}-*/orders.csv'))}",
+    f"runs: {len(glob.glob(f'artifacts/benchmarks/runs/{campaign}-*/orders.csv'))}",
     f"orders compared: {wins + ties + losses}",
     f"hybrid wins: {wins}",
     f"ties: {ties}",

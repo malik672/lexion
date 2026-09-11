@@ -140,6 +140,8 @@ async fn main() -> Result<()> {
 
         let mut num_swaps: Option<usize> = None;
         let mut protocols: Option<String> = None;
+        let mut is_split = None;
+        let mut topology_signature = None;
         let (status, gas_estimate, actual_gas, error_reason) = match quoter.quote(trade).await {
             QuoteOutcome::NoRoute(reason) => (RowStatus::NoQuote, None, None, Some(reason)),
             QuoteOutcome::NoEncoding => {
@@ -156,6 +158,12 @@ async fn main() -> Result<()> {
                 }
                 if let Some(route) = quote.route() {
                     num_swaps = Some(route.swaps().len());
+                    is_split = Some(
+                        route
+                            .swaps()
+                            .iter()
+                            .any(|swap| swap.split() > 0.0),
+                    );
                     protocols = Some(
                         route
                             .swaps()
@@ -164,6 +172,7 @@ async fn main() -> Result<()> {
                             .collect::<Vec<_>>()
                             .join(","),
                     );
+                    topology_signature = Some(route_topology_signature(route));
                 }
                 match simulator
                     .simulate(quoter.client(), &quote)
@@ -203,6 +212,8 @@ async fn main() -> Result<()> {
             error_reason,
             num_swaps,
             protocols,
+            is_split,
+            topology_signature,
         });
     }
 
@@ -221,6 +232,22 @@ async fn main() -> Result<()> {
     info!("wrote {}", results_csv.display());
     info!("wrote {}", report_md.display());
     Ok(())
+}
+
+/// Returns the finite route properties currently visible to the symbolic gas estimator.
+fn route_topology_signature(route: &fynd_client::Route) -> String {
+    let split = route
+        .swaps()
+        .iter()
+        .any(|swap| swap.split() > 0.0);
+    let strategy = if split { "split" } else { "sequential" };
+    let protocols = route
+        .swaps()
+        .iter()
+        .map(|swap| swap.protocol())
+        .collect::<Vec<_>>()
+        .join(">");
+    format!("{strategy}:{}:{protocols}", route.swaps().len())
 }
 
 /// Fetch an ETH price via a single 1-WETH→USDC Fynd quote. The result is

@@ -3,13 +3,14 @@
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
 use rustc_hash::{FxHashMap, FxHashSet};
+use tycho_simulation::evm::protocol::{
+    uniswap_v2::state::UniswapV2State, uniswap_v3::state::UniswapV3State,
+    uniswap_v4::state::UniswapV4State,
+};
 
 use super::{
     bellman_ford::BellmanFordContext,
     split_primitives::{simulate_path, HopDescriptor, MarketOverrides},
-};
-use tycho_simulation::evm::protocol::{
-    uniswap_v2::state::UniswapV2State, uniswap_v3::state::UniswapV3State,
 };
 
 const GRID_CELLS: u64 = 64;
@@ -23,12 +24,7 @@ struct ExactPathCache<'a> {
 
 impl<'a> ExactPathCache<'a> {
     fn new(paths: &'a [Vec<HopDescriptor>], ctx: &'a BellmanFordContext) -> Self {
-        Self {
-            paths,
-            ctx,
-            values: vec![FxHashMap::default(); paths.len()],
-            simulations: 0,
-        }
+        Self { paths, ctx, values: vec![FxHashMap::default(); paths.len()], simulations: 0 }
     }
 
     fn output(&mut self, path_index: usize, amount: &BigUint) -> Option<BigUint> {
@@ -79,13 +75,30 @@ fn pool_disjoint(left: &[HopDescriptor], right: &[HopDescriptor]) -> bool {
 fn protocol_word(path: &[HopDescriptor], ctx: &BellmanFordContext) -> String {
     path.iter()
         .map(|hop| {
-            let Some(state) = ctx.market_data.get_simulation_state(&hop.component_id) else {
+            let Some(state) = ctx
+                .market_data
+                .get_simulation_state(&hop.component_id)
+            else {
                 return '?';
             };
-            if state.as_any().downcast_ref::<UniswapV2State>().is_some() {
+            if state
+                .as_any()
+                .downcast_ref::<UniswapV2State>()
+                .is_some()
+            {
                 '2'
-            } else if state.as_any().downcast_ref::<UniswapV3State>().is_some() {
+            } else if state
+                .as_any()
+                .downcast_ref::<UniswapV3State>()
+                .is_some()
+            {
                 '3'
+            } else if state
+                .as_any()
+                .downcast_ref::<UniswapV4State>()
+                .is_some()
+            {
+                '4'
             } else {
                 '?'
             }
@@ -94,35 +107,64 @@ fn protocol_word(path: &[HopDescriptor], ctx: &BellmanFordContext) -> String {
 }
 
 fn is_v2_only(path: &[HopDescriptor], ctx: &BellmanFordContext) -> bool {
-    !path.is_empty()
-        && path.iter().all(|hop| {
+    !path.is_empty() &&
+        path.iter().all(|hop| {
             ctx.market_data
                 .get_simulation_state(&hop.component_id)
-                .is_some_and(|state| state.as_any().downcast_ref::<UniswapV2State>().is_some())
+                .is_some_and(|state| {
+                    state
+                        .as_any()
+                        .downcast_ref::<UniswapV2State>()
+                        .is_some()
+                })
         })
 }
 
 fn path_family(path: &[HopDescriptor], ctx: &BellmanFordContext) -> &'static str {
     let mut has_v2 = false;
     let mut has_v3 = false;
+    let mut has_v4 = false;
     for hop in path {
-        let Some(state) = ctx.market_data.get_simulation_state(&hop.component_id) else {
+        let Some(state) = ctx
+            .market_data
+            .get_simulation_state(&hop.component_id)
+        else {
             return "unknown";
         };
-        if state.as_any().downcast_ref::<UniswapV2State>().is_some() {
+        if state
+            .as_any()
+            .downcast_ref::<UniswapV2State>()
+            .is_some()
+        {
             has_v2 = true;
-        } else if state.as_any().downcast_ref::<UniswapV3State>().is_some() {
+        } else if state
+            .as_any()
+            .downcast_ref::<UniswapV3State>()
+            .is_some()
+        {
             has_v3 = true;
+        } else if state
+            .as_any()
+            .downcast_ref::<UniswapV4State>()
+            .is_some()
+        {
+            has_v4 = true;
         } else {
             return "unknown";
         }
     }
-    match (path.len(), has_v2, has_v3) {
-        (1, true, false) => "v2-1hop",
-        (1, false, true) => "v3-1hop",
-        (_, true, false) => "v2-multi",
-        (_, false, true) => "v3-multi",
-        (_, true, true) => "mixed-multi",
+    let families = [has_v2, has_v3, has_v4]
+        .into_iter()
+        .filter(|has| *has)
+        .count();
+    match (path.len(), has_v2, has_v3, has_v4) {
+        (1, true, false, false) => "v2-1hop",
+        (1, false, true, false) => "v3-1hop",
+        (1, false, false, true) => "v4-1hop",
+        (_, true, false, false) => "v2-multi",
+        (_, false, true, false) => "v3-multi",
+        (_, false, false, true) => "v4-multi",
+        (_, _, _, _) if families > 1 => "mixed-multi",
         _ => "unknown",
     }
 }
@@ -160,14 +202,10 @@ fn v2_propagated_rounding_bound(
     }
 
     let suffix = &path[1..];
-    let suffix_one = simulate_path(
-        suffix,
-        &BigUint::from(1u8),
-        &ctx.market_data,
-        &MarketOverrides::empty(),
-    )
-    .ok()?
-    .amount_out;
+    let suffix_one =
+        simulate_path(suffix, &BigUint::from(1u8), &ctx.market_data, &MarketOverrides::empty())
+            .ok()?
+            .amount_out;
     let suffix_error = v2_propagated_rounding_bound(suffix, ctx)?;
     Some(BigUint::from(1u8) + suffix_one + suffix_error)
 }
@@ -201,11 +239,21 @@ impl DefectStats {
     fn observe(&mut self, numerator: &BigInt, denominator: &BigInt, midpoint: &BigUint) {
         self.violating_triples += 1;
         let ceil_raw = ceil_ratio(numerator, denominator);
-        if ceil_raw <= BigUint::from(1u8) { self.raw_le_1 += 1; }
-        if ceil_raw <= BigUint::from(2u8) { self.raw_le_2 += 1; }
-        if ceil_raw <= BigUint::from(10u8) { self.raw_le_10 += 1; }
-        if ceil_raw <= BigUint::from(100u8) { self.raw_le_100 += 1; }
-        if ceil_raw > self.max_ceil_raw { self.max_ceil_raw = ceil_raw; }
+        if ceil_raw <= BigUint::from(1u8) {
+            self.raw_le_1 += 1;
+        }
+        if ceil_raw <= BigUint::from(2u8) {
+            self.raw_le_2 += 1;
+        }
+        if ceil_raw <= BigUint::from(10u8) {
+            self.raw_le_10 += 1;
+        }
+        if ceil_raw <= BigUint::from(100u8) {
+            self.raw_le_100 += 1;
+        }
+        if ceil_raw > self.max_ceil_raw {
+            self.max_ceil_raw = ceil_raw;
+        }
 
         if midpoint == &BigUint::from(0u8) {
             self.ppm_gt_10 += 1;
@@ -213,9 +261,17 @@ impl DefectStats {
         }
         let ppm_num = numerator * BigInt::from(1_000_000u64);
         let ppm_den = denominator * BigInt::from(midpoint.clone());
-        let ppm_ceil = ceil_ratio(&ppm_num, &ppm_den).to_u64().unwrap_or(u64::MAX);
-        if ppm_ceil <= 1 { self.ppm_le_1 += 1; }
-        if ppm_ceil <= 10 { self.ppm_le_10 += 1; } else { self.ppm_gt_10 += 1; }
+        let ppm_ceil = ceil_ratio(&ppm_num, &ppm_den)
+            .to_u64()
+            .unwrap_or(u64::MAX);
+        if ppm_ceil <= 1 {
+            self.ppm_le_1 += 1;
+        }
+        if ppm_ceil <= 10 {
+            self.ppm_le_10 += 1;
+        } else {
+            self.ppm_gt_10 += 1;
+        }
         self.max_ppm_ceil = self.max_ppm_ceil.max(ppm_ceil);
     }
 }
@@ -247,14 +303,30 @@ impl V2SlackStats {
         propagated_bound: &BigUint,
     ) {
         self.violating_triples += 1;
-        if defect > &BigUint::from(1u8) { self.slack_1_failures += 1; }
-        if defect > &BigUint::from(2u8) { self.slack_2_failures += 1; }
-        if defect > &BigUint::from(3u8) { self.slack_3_failures += 1; }
-        if defect > &BigUint::from(4u8) { self.slack_4_failures += 1; }
-        if defect > &BigUint::from(left_hops.max(right_hops)) { self.max_hops_failures += 1; }
-        if defect > &BigUint::from(left_hops + right_hops) { self.sum_hops_failures += 1; }
-        if defect > propagated_bound { self.propagated_failures += 1; }
-        if defect > &self.max_required_slack { self.max_required_slack = defect.clone(); }
+        if defect > &BigUint::from(1u8) {
+            self.slack_1_failures += 1;
+        }
+        if defect > &BigUint::from(2u8) {
+            self.slack_2_failures += 1;
+        }
+        if defect > &BigUint::from(3u8) {
+            self.slack_3_failures += 1;
+        }
+        if defect > &BigUint::from(4u8) {
+            self.slack_4_failures += 1;
+        }
+        if defect > &BigUint::from(left_hops.max(right_hops)) {
+            self.max_hops_failures += 1;
+        }
+        if defect > &BigUint::from(left_hops + right_hops) {
+            self.sum_hops_failures += 1;
+        }
+        if defect > propagated_bound {
+            self.propagated_failures += 1;
+        }
+        if defect > &self.max_required_slack {
+            self.max_required_slack = defect.clone();
+        }
         if propagated_bound > &self.max_propagated_bound {
             self.max_propagated_bound = propagated_bound.clone();
         }
@@ -285,11 +357,7 @@ struct V2SlackCounterexample {
     propagated_bound: BigUint,
 }
 
-pub(super) fn emit(
-    paths: &[Vec<HopDescriptor>],
-    total: &BigUint,
-    ctx: &BellmanFordContext,
-) {
+pub(super) fn emit(paths: &[Vec<HopDescriptor>], total: &BigUint, ctx: &BellmanFordContext) {
     if paths.len() < 2 || total == &BigUint::from(0u8) {
         return;
     }
@@ -326,11 +394,8 @@ pub(super) fn emit(
                 protocol_word(&paths[left], ctx),
                 protocol_word(&paths[right], ctx)
             );
-            let family = format!(
-                "{}+{}",
-                path_family(&paths[left], ctx),
-                path_family(&paths[right], ctx)
-            );
+            let family =
+                format!("{}+{}", path_family(&paths[left], ctx), path_family(&paths[right], ctx));
             let v2_only = is_v2_only(&paths[left], ctx) && is_v2_only(&paths[right], ctx);
             let v2_hop_class = format!("{}+{} hops", paths[left].len(), paths[right].len());
             let pair_propagated_bound = if v2_only {
@@ -344,17 +409,26 @@ pub(super) fn emit(
                 None
             };
 
-            classes.entry(class.clone()).or_default().pairs += 1;
+            classes
+                .entry(class.clone())
+                .or_default()
+                .pairs += 1;
             if v2_only {
                 v2_slack_total.pairs += 1;
-                v2_slack_classes.entry(v2_hop_class.clone()).or_default().pairs += 1;
+                v2_slack_classes
+                    .entry(v2_hop_class.clone())
+                    .or_default()
+                    .pairs += 1;
             }
 
             let mut points = Vec::with_capacity((GRID_CELLS + 1) as usize);
             let mut pair_complete = true;
             for i in 0..=GRID_CELLS {
                 let x = (total * BigUint::from(i)) / BigUint::from(GRID_CELLS);
-                if points.last().is_some_and(|(prev, _): &(BigUint, BigUint)| prev == &x) {
+                if points
+                    .last()
+                    .is_some_and(|(prev, _): &(BigUint, BigUint)| prev == &x)
+                {
                     continue;
                 }
                 let Some(y) = pair_output(&mut cache, left, right, total, &x) else {
@@ -364,7 +438,9 @@ pub(super) fn emit(
                 points.push((x, y));
             }
 
-            let stats = classes.get_mut(&class).expect("class inserted above");
+            let stats = classes
+                .get_mut(&class)
+                .expect("class inserted above");
             if !pair_complete || points.len() < 3 {
                 incomplete += 1;
                 stats.incomplete += 1;
@@ -442,16 +518,9 @@ pub(super) fn emit(
                     v2_slack_classes
                         .get_mut(&v2_hop_class)
                         .expect("V2 class inserted above")
-                        .observe_defect(
-                            &defect_ceil_raw,
-                            left_hops,
-                            right_hops,
-                            propagated_bound,
-                        );
+                        .observe_defect(&defect_ceil_raw, left_hops, right_hops, propagated_bound);
 
-                    if first_v2_counterexamples.len() < 12
-                        && defect_ceil_raw > *propagated_bound
-                    {
+                    if first_v2_counterexamples.len() < 12 && defect_ceil_raw > *propagated_bound {
                         first_v2_counterexamples.push(V2SlackCounterexample {
                             left,
                             right,
@@ -527,8 +596,16 @@ pub(super) fn emit(
     if !first_violations.is_empty() {
         eprintln!("first concavity violations (up to 12):");
         for v in &first_violations {
-            let left = paths[v.left].iter().map(|h| h.component_id.as_str()).collect::<Vec<_>>().join(" -> ");
-            let right = paths[v.right].iter().map(|h| h.component_id.as_str()).collect::<Vec<_>>().join(" -> ");
+            let left = paths[v.left]
+                .iter()
+                .map(|h| h.component_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            let right = paths[v.right]
+                .iter()
+                .map(|h| h.component_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
             eprintln!("  class={} left={} right={}", v.class, left, right);
             eprintln!(
                 "    x=[{}, {}, {}] F=[{}, {}, {}] defect<= {} raw, {} ppm",
@@ -550,7 +627,9 @@ pub(super) fn emit(
     eprintln!("max ceil defect raw:           {}", defect_total.max_ceil_raw);
     eprintln!("max ceil defect ppm:           {}", defect_total.max_ppm_ceil);
 
-    let mut defect_rows = defect_classes.into_iter().collect::<Vec<_>>();
+    let mut defect_rows = defect_classes
+        .into_iter()
+        .collect::<Vec<_>>();
     defect_rows.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     if !defect_rows.is_empty() {
         eprintln!("path-family defect classes:");
@@ -579,7 +658,9 @@ pub(super) fn emit(
     eprintln!("candidate sum(hops) failures:  {}", v2_slack_total.sum_hops_failures);
     eprintln!("max observed required slack:   {} raw units", v2_slack_total.max_required_slack);
 
-    let mut v2_rows = v2_slack_classes.into_iter().collect::<Vec<_>>();
+    let mut v2_rows = v2_slack_classes
+        .into_iter()
+        .collect::<Vec<_>>();
     v2_rows.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     if !v2_rows.is_empty() {
         eprintln!("V2 hop-count classes:");
@@ -604,8 +685,16 @@ pub(super) fn emit(
     if !first_v2_counterexamples.is_empty() {
         eprintln!("first propagated-bound counterexamples (up to 12):");
         for v in first_v2_counterexamples {
-            let left = paths[v.left].iter().map(|h| h.component_id.as_str()).collect::<Vec<_>>().join(" -> ");
-            let right = paths[v.right].iter().map(|h| h.component_id.as_str()).collect::<Vec<_>>().join(" -> ");
+            let left = paths[v.left]
+                .iter()
+                .map(|h| h.component_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            let right = paths[v.right]
+                .iter()
+                .map(|h| h.component_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
             eprintln!(
                 "  left={} right={} x=[{}, {}, {}] defect={} propagated_bound={}",
                 left, right, v.x0, v.x1, v.x2, v.defect, v.propagated_bound

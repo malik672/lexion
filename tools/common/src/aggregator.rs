@@ -61,8 +61,8 @@ pub struct AggregatorQuote {
     pub status: AggregatorStatus,
     /// Output amount as a decimal string (token units).
     pub amount_out: Option<String>,
-    /// Output amount net of gas costs (token units). Only populated by Fynd; `None` for all
-    /// other aggregators. Used as the baseline when computing gas-adjusted bps diffs.
+    /// Output amount net of user-paid execution costs (token units). Populated by Fynd and by
+    /// gasless settlement systems whose quoted output already includes their execution fee.
     pub amount_out_net_gas: Option<String>,
     /// Total estimated gas units across all route legs.
     pub gas_units: Option<u64>,

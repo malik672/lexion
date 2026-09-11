@@ -90,8 +90,8 @@ echo "amount multiplier: $AMOUNT_MULTIPLIER"
   --configs path_frank_wolfe_native_d2,path_frank_wolfe_d2 \
   ${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}
 
-REPORT="bench-results/$NAME/report.md"
-ORDERS_CSV="bench-results/$NAME/orders.csv"
+REPORT="artifacts/benchmarks/runs/$NAME/report.md"
+ORDERS_CSV="artifacts/benchmarks/runs/$NAME/orders.csv"
 echo
 echo "Native Fynd vs Fynd + exact V2/V3 refinement:"
 echo "  $REPORT"

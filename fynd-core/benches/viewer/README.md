@@ -1,6 +1,6 @@
 # Benchmark result viewer
 
-A single static page that reads `bench-results/` and shows a run two ways: the aggregate report,
+A single static page that reads `artifacts/benchmarks/runs/` and shows a run two ways: the aggregate report,
 and one order at a time with each config's route drawn as a token flow.
 
 ```bash
@@ -16,7 +16,7 @@ just as well.
 
 | file | used for |
 |---|---|
-| `bench-results/index.json` | the run picker. Rebuilt by every run, by scanning for `run.json` |
+| `artifacts/benchmarks/runs/index.json` | the run picker. Rebuilt by every run, by scanning for `run.json` |
 | `<run>/run.json` | header facts: which market, orders, baseline, configs, gas price, timeout |
 | `<run>/orders.csv` | the whole Report tab — scorecards, distribution, speed, pairs |
 | `<run>/routes.jsonl` | the Orders tab. Fetched only when that tab is opened, since it is the big one |

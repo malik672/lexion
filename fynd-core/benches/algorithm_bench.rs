@@ -143,7 +143,7 @@ const PAIR_ROWS: usize = 30;
                   gas against the baseline, per token pair and overall.\n\n\
                   The market is either the recorded fixture (--market offline, reproducible) or \
                   one block captured live from Tycho (--market live).\n\n\
-                  Writes bench-results/<name>/\
+                  Writes artifacts/benchmarks/runs/<name>/\
                   {report.md,orders.csv,pairs.csv,protocols.csv,routes.jsonl}."
 )]
 struct Args {
@@ -196,7 +196,7 @@ struct Args {
 
     /// Directory the run's output directory is created under. Deliberately not under `target/`:
     /// these are results to keep and compare, and `cargo clean` would take them.
-    #[arg(long, default_value = "bench-results")]
+    #[arg(long, default_value = "artifacts/benchmarks/runs")]
     out_dir: PathBuf,
 
     /// Emit the solver's own logs. `RUST_LOG` picks the filter, e.g.

@@ -1,4 +1,4 @@
-//! External aggregator clients for Fynd audit comparisons (Nordstern, KyberSwap, 0x).
+//! External aggregator clients for Fynd audit comparisons.
 //!
 //! Add a new aggregator by implementing [`AggregatorClient`] and constructing it in
 //! `audit::run`. The shared quote model (`AggregatorClient`, `AggregatorQuote`, …) lives in
@@ -11,6 +11,498 @@ use fynd_tools_common::aggregator::{
     AggregatorCalldata, AggregatorClient, AggregatorQuote, AggregatorStatus,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
+
+// ─── ParaSwap / Velora Market API ─────────────────────────────────────────────────────────────
+
+/// Quote client for ParaSwap's current v6.2 Market API.
+pub struct ParaswapClient {
+    client: reqwest::Client,
+    base_url: String,
+    chain_id: u64,
+    dexes: Option<String>,
+    decimals: OnceCell<HashMap<String, u8>>,
+}
+
+impl ParaswapClient {
+    pub fn new(
+        base_url: impl Into<String>,
+        chain_id: u64,
+        dexes: Option<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to build ParaSwap HTTP client: {e}"))?,
+            base_url: base_url.into(),
+            chain_id,
+            dexes,
+            decimals: OnceCell::new(),
+        })
+    }
+
+    async fn decimals(&self) -> anyhow::Result<&HashMap<String, u8>> {
+        self.decimals
+            .get_or_try_init(|| async {
+                #[derive(Deserialize)]
+                struct TokensResponse {
+                    tokens: Vec<Token>,
+                }
+                #[derive(Deserialize)]
+                struct Token {
+                    address: String,
+                    decimals: u8,
+                }
+                let response = self
+                    .client
+                    .get(format!(
+                        "{}/tokens/{}",
+                        self.base_url.trim_end_matches('/'),
+                        self.chain_id
+                    ))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<TokensResponse>()
+                    .await?;
+                Ok(response
+                    .tokens
+                    .into_iter()
+                    .map(|token| (token.address.to_ascii_lowercase(), token.decimals))
+                    .collect())
+            })
+            .await
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParaswapPriceResponse {
+    price_route: ParaswapPriceRoute,
+    tx_params: Option<ParaswapTransaction>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParaswapPriceRoute {
+    dest_amount: String,
+    gas_cost: Option<String>,
+    best_route: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ParaswapTransaction {
+    to: String,
+    data: String,
+    value: String,
+}
+
+#[async_trait]
+impl AggregatorClient for ParaswapClient {
+    fn name(&self) -> &str {
+        "paraswap"
+    }
+
+    async fn quote(
+        &self,
+        token_in: &str,
+        token_out: &str,
+        amount: &str,
+        wallet: Option<&str>,
+    ) -> anyhow::Result<AggregatorQuote> {
+        let start = Instant::now();
+        let decimals = self.decimals().await?;
+        let Some(src_decimals) = decimals.get(&token_in.to_ascii_lowercase()) else {
+            anyhow::bail!("ParaSwap has no decimals for source token {token_in}");
+        };
+        let Some(dest_decimals) = decimals.get(&token_out.to_ascii_lowercase()) else {
+            anyhow::bail!("ParaSwap has no decimals for destination token {token_out}");
+        };
+        let src_decimals = src_decimals.to_string();
+        let dest_decimals = dest_decimals.to_string();
+        let chain_id = self.chain_id.to_string();
+        let endpoint = if wallet.is_some() { "swap" } else { "prices" };
+        let mut request = self
+            .client
+            .get(format!("{}/{endpoint}", self.base_url.trim_end_matches('/')))
+            .query(&[
+                ("srcToken", token_in),
+                ("destToken", token_out),
+                ("amount", amount),
+                ("srcDecimals", src_decimals.as_str()),
+                ("destDecimals", dest_decimals.as_str()),
+                ("side", "SELL"),
+                ("network", chain_id.as_str()),
+                ("version", "6.2"),
+                ("ignoreBadUsdPrice", "true"),
+            ]);
+        if let Some(dexes) = &self.dexes {
+            request = request.query(&[("includeDEXS", dexes)]);
+        }
+        if let Some(wallet) = wallet {
+            request = request.query(&[("userAddress", wallet), ("slippage", "50")]);
+        }
+        let response = request.send().await;
+        let response_time_ms = start.elapsed().as_millis() as u64;
+        let response = response.map_err(|e| anyhow::anyhow!("ParaSwap request failed: {e}"))?;
+        if !response.status().is_success() {
+            let code = response.status().as_u16();
+            let snippet = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(120)
+                .collect();
+            return Ok(AggregatorQuote {
+                status: AggregatorStatus::HttpError { code, snippet },
+                amount_out: None,
+                amount_out_net_gas: None,
+                gas_units: None,
+                protocols: vec![],
+                num_splits: None,
+                response_time_ms,
+                calldata: None,
+                route: None,
+            });
+        }
+        let data = response
+            .json::<ParaswapPriceResponse>()
+            .await
+            .map_err(|e| anyhow::anyhow!("ParaSwap parse error: {e}"))?;
+        let amount_out =
+            (data.price_route.dest_amount != "0").then_some(data.price_route.dest_amount);
+        let gas_units = data
+            .price_route
+            .gas_cost
+            .and_then(|gas| gas.parse().ok());
+        let mut protocols = Vec::new();
+        if let Some(route) = data.price_route.best_route {
+            walk_protocol_names(&route, &mut protocols);
+        }
+        let calldata = data
+            .tx_params
+            .map(|tx| AggregatorCalldata { to: tx.to, data: tx.data, value: tx.value });
+        protocols.sort();
+        protocols.dedup();
+        Ok(AggregatorQuote {
+            status: if amount_out.is_some() {
+                AggregatorStatus::Success
+            } else {
+                AggregatorStatus::NoAmount
+            },
+            amount_out,
+            amount_out_net_gas: None,
+            gas_units,
+            protocols,
+            num_splits: None,
+            response_time_ms,
+            calldata,
+            route: None,
+        })
+    }
+}
+
+// ─── 1inch Swap API ─────────────────────────────────────────────────────────
+
+/// Client for the authenticated 1inch Swap API.
+pub struct OneInchClient {
+    client: reqwest::Client,
+    base_url: String,
+    chain_id: u64,
+}
+
+impl OneInchClient {
+    pub fn new(
+        base_url: impl Into<String>,
+        chain_id: u64,
+        api_key: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", api_key.into()))
+                .map_err(|_| anyhow::anyhow!("ONEINCH_API_KEY contains invalid characters"))?,
+        );
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .default_headers(headers)
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to build 1inch HTTP client: {e}"))?,
+            base_url: base_url.into(),
+            chain_id,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OneInchResponse {
+    dst_amount: Option<String>,
+    tx: Option<OneInchTransaction>,
+    protocols: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct OneInchTransaction {
+    to: Option<String>,
+    data: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    gas: Option<u64>,
+}
+
+#[async_trait]
+impl AggregatorClient for OneInchClient {
+    fn name(&self) -> &str {
+        "1inch"
+    }
+
+    async fn quote(
+        &self,
+        token_in: &str,
+        token_out: &str,
+        amount: &str,
+        wallet: Option<&str>,
+    ) -> anyhow::Result<AggregatorQuote> {
+        let start = Instant::now();
+        let from = wallet.unwrap_or("0x00000000000000000000000000000000badbabe");
+        let url = format!("{}/{}/swap", self.base_url.trim_end_matches('/'), self.chain_id);
+        let resp = self
+            .client
+            .get(url)
+            .query(&[
+                ("src", token_in),
+                ("dst", token_out),
+                ("amount", amount),
+                ("from", from),
+                ("slippage", "0.5"),
+                ("disableEstimate", "true"),
+            ])
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("1inch request failed: {e}"))?;
+        let response_time_ms = start.elapsed().as_millis() as u64;
+        if !resp.status().is_success() {
+            let code = resp.status().as_u16();
+            let snippet = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(120)
+                .collect();
+            return Ok(AggregatorQuote {
+                status: AggregatorStatus::HttpError { code, snippet },
+                amount_out: None,
+                amount_out_net_gas: None,
+                gas_units: None,
+                protocols: vec![],
+                num_splits: None,
+                response_time_ms,
+                calldata: None,
+                route: None,
+            });
+        }
+        let data = resp
+            .json::<OneInchResponse>()
+            .await
+            .map_err(|e| anyhow::anyhow!("1inch parse error: {e}"))?;
+        let amount_out = data
+            .dst_amount
+            .filter(|amount| amount != "0" && !amount.is_empty());
+        let gas_units = data
+            .tx
+            .as_ref()
+            .and_then(|tx| tx.gas)
+            .filter(|&gas| gas > 0);
+        let calldata = data.tx.and_then(|tx| {
+            Some(AggregatorCalldata {
+                to: tx.to?,
+                data: tx.data?,
+                value: tx
+                    .value
+                    .unwrap_or_else(|| "0".to_owned()),
+            })
+        });
+        let mut protocols = Vec::new();
+        if let Some(value) = data.protocols {
+            walk_protocol_names(&value, &mut protocols);
+        }
+        protocols.sort();
+        protocols.dedup();
+        Ok(AggregatorQuote {
+            status: if amount_out.is_some() {
+                AggregatorStatus::Success
+            } else {
+                AggregatorStatus::NoAmount
+            },
+            amount_out,
+            amount_out_net_gas: None,
+            gas_units,
+            protocols,
+            num_splits: None,
+            response_time_ms,
+            calldata,
+            route: None,
+        })
+    }
+}
+
+fn walk_protocol_names(value: &serde_json::Value, names: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .for_each(|value| walk_protocol_names(value, names)),
+        serde_json::Value::Object(map) => {
+            if let Some(name) = map
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+            {
+                names.push(name.to_owned());
+            }
+            if let Some(exchange) = map
+                .get("exchange")
+                .and_then(serde_json::Value::as_str)
+            {
+                names.push(exchange.to_owned());
+            }
+            map.values()
+                .for_each(|value| walk_protocol_names(value, names));
+        }
+        _ => {}
+    }
+}
+
+/// Client for CoW Protocol's sell-order quote endpoint.
+///
+/// `buyAmount` is already the user's output after CoW's fee. CoW settles the order for the
+/// user, so its settlement gas must not be subtracted from that amount a second time.
+pub struct CowSwapClient {
+    client: reqwest::Client,
+    base_url: String,
+}
+
+impl CowSwapClient {
+    pub fn new(base_url: impl Into<String>) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to build CoW Swap HTTP client: {e}"))?,
+            base_url: base_url.into(),
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CowQuoteRequest<'a> {
+    sell_token: &'a str,
+    buy_token: &'a str,
+    from: &'a str,
+    receiver: &'a str,
+    sell_amount_before_fee: &'a str,
+    kind: &'static str,
+    valid_to: u64,
+    partially_fillable: bool,
+    signing_scheme: &'static str,
+}
+
+#[derive(Deserialize)]
+struct CowQuoteResponse {
+    quote: CowQuote,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CowQuote {
+    buy_amount: String,
+}
+
+#[async_trait]
+impl AggregatorClient for CowSwapClient {
+    fn name(&self) -> &str {
+        "cowswap"
+    }
+
+    async fn quote(
+        &self,
+        token_in: &str,
+        token_out: &str,
+        amount: &str,
+        wallet: Option<&str>,
+    ) -> anyhow::Result<AggregatorQuote> {
+        let start = Instant::now();
+        let owner = wallet.unwrap_or("0x00000000000000000000000000000000badbabe");
+        let valid_to = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| anyhow::anyhow!("system clock is before Unix epoch: {e}"))?
+            .as_secs() +
+            3_600;
+        let request = CowQuoteRequest {
+            sell_token: token_in,
+            buy_token: token_out,
+            from: owner,
+            receiver: owner,
+            sell_amount_before_fee: amount,
+            kind: "sell",
+            valid_to,
+            partially_fillable: false,
+            signing_scheme: "eip712",
+        };
+        let resp = self
+            .client
+            .post(format!("{}/api/v1/quote", self.base_url.trim_end_matches('/')))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("CoW Swap request failed: {e}"))?;
+        let response_time_ms = start.elapsed().as_millis() as u64;
+
+        if !resp.status().is_success() {
+            let code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(120).collect();
+            return Ok(AggregatorQuote {
+                status: AggregatorStatus::HttpError { code, snippet },
+                amount_out: None,
+                amount_out_net_gas: None,
+                gas_units: None,
+                protocols: vec![],
+                num_splits: None,
+                response_time_ms,
+                calldata: None,
+                route: None,
+            });
+        }
+
+        let data = resp
+            .json::<CowQuoteResponse>()
+            .await
+            .map_err(|e| anyhow::anyhow!("CoW Swap parse error: {e}"))?;
+        let amount_out = (data.quote.buy_amount != "0").then_some(data.quote.buy_amount);
+        Ok(AggregatorQuote {
+            status: if amount_out.is_some() {
+                AggregatorStatus::Success
+            } else {
+                AggregatorStatus::NoAmount
+            },
+            amount_out_net_gas: amount_out.clone(),
+            amount_out,
+            gas_units: None,
+            protocols: vec!["cow_protocol".to_string()],
+            num_splits: None,
+            response_time_ms,
+            calldata: None,
+            route: None,
+        })
+    }
+}
 
 // ─── Nordstern Finance ────────────────────────────────────────────────────────
 

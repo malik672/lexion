@@ -33,8 +33,24 @@ use crate::{
 };
 
 /// List of available built-in algorithm names (for registry-based dispatch).
-pub(crate) const AVAILABLE_ALGORITHMS: &[&str] =
-    &["most_liquid", "bellman_ford", "path_frank_wolfe", "path_frank_wolfe_native", "water_fill"];
+pub(crate) const AVAILABLE_ALGORITHMS: &[&str] = &[
+    "most_liquid",
+    "bellman_ford",
+    "path_frank_wolfe",
+    "path_frank_wolfe_exact_refinement",
+    "path_frank_wolfe_multiscale",
+    "path_frank_wolfe_multiscale_cutoff_001bps",
+    "path_frank_wolfe_multiscale_no_v4",
+    "path_frank_wolfe_multiscale_v4_ordered",
+    "path_frank_wolfe_multiscale_v4_exhaustive",
+    "path_frank_wolfe_multiscale_v4_exhaustive_unpruned",
+    "path_frank_wolfe_multiscale_v4_maximal_unpruned",
+    "path_frank_wolfe_multiscale_v4_certified_pair_faces",
+    "path_frank_wolfe_multiscale_v4_certified",
+    "path_frank_wolfe_native",
+    "path_frank_wolfe_no_v4_exact",
+    "water_fill",
+];
 
 /// Default algorithm to use if none specified.
 pub(crate) const DEFAULT_ALGORITHM: &str = "most_liquid";
@@ -140,7 +156,40 @@ impl AlgorithmSpawner {
                 "most_liquid" => Ok(spawn_most_liquid_workers(params)),
                 "bellman_ford" => Ok(spawn_bellman_ford_workers(params)),
                 "path_frank_wolfe" => Ok(spawn_path_frank_wolfe_workers(params)),
+                "path_frank_wolfe_exact_refinement" => {
+                    Ok(spawn_exact_refinement_path_frank_wolfe_workers(params))
+                }
+                "path_frank_wolfe_multiscale" => {
+                    Ok(spawn_multi_scale_path_frank_wolfe_workers(params))
+                }
+                "path_frank_wolfe_multiscale_cutoff_001bps" => {
+                    Ok(spawn_multi_scale_cutoff_path_frank_wolfe_workers(params))
+                }
+                "path_frank_wolfe_multiscale_no_v4" => {
+                    Ok(spawn_multi_scale_no_v4_path_frank_wolfe_workers(params))
+                }
+                "path_frank_wolfe_multiscale_v4_exhaustive" => {
+                    Ok(spawn_multi_scale_v4_exhaustive_workers(params))
+                }
+                "path_frank_wolfe_multiscale_v4_ordered" => {
+                    Ok(spawn_multi_scale_v4_ordered_workers(params))
+                }
+                "path_frank_wolfe_multiscale_v4_maximal_unpruned" => {
+                    Ok(spawn_multi_scale_v4_maximal_unpruned_workers(params))
+                }
+                "path_frank_wolfe_multiscale_v4_certified_pair_faces" => {
+                    Ok(spawn_multi_scale_v4_certified_pair_face_workers(params))
+                }
+                "path_frank_wolfe_multiscale_v4_exhaustive_unpruned" => {
+                    Ok(spawn_multi_scale_v4_exhaustive_unpruned_workers(params))
+                }
+                "path_frank_wolfe_multiscale_v4_certified" => {
+                    Ok(spawn_multi_scale_v4_certified_workers(params))
+                }
                 "path_frank_wolfe_native" => Ok(spawn_native_path_frank_wolfe_workers(params)),
+                "path_frank_wolfe_no_v4_exact" => {
+                    Ok(spawn_no_v4_exact_path_frank_wolfe_workers(params))
+                }
                 "water_fill" => Ok(spawn_water_fill_workers(params)),
                 _ => Err(UnknownAlgorithmError::of(algorithm, Vec::new())),
             },
@@ -264,11 +313,125 @@ fn spawn_path_frank_wolfe_workers(params: SpawnWorkersParams) -> Vec<JoinHandle<
     spawn_workers_generic(params, &factory)
 }
 
+/// Spawns native Path Frank-Wolfe with only its discovered portfolio reallocated exactly.
+fn spawn_exact_refinement_path_frank_wolfe_workers(
+    params: SpawnWorkersParams,
+) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_local_exact_refinement_only()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns the experimental multi-scale-frontier PathFrankWolfe algorithm.
+fn spawn_multi_scale_path_frank_wolfe_workers(params: SpawnWorkersParams) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_multi_scale_frontier()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns multi-scale routing with a 0.01-basis-point exact-allocation cutoff.
+fn spawn_multi_scale_cutoff_path_frank_wolfe_workers(
+    params: SpawnWorkersParams,
+) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_multi_scale_frontier()
+            .with_exact_allocation_cutoff(1)
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns the cumulative ablation with exact allocation and multi-scale discovery, but no V4.
+fn spawn_multi_scale_no_v4_path_frank_wolfe_workers(
+    params: SpawnWorkersParams,
+) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_multi_scale_frontier_without_v4()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns the analysis control that enumerates V4-compatible subsets without quotienting.
+fn spawn_multi_scale_v4_exhaustive_workers(params: SpawnWorkersParams) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_exhaustive_v4_subsets()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns the ordered-history analysis control.
+fn spawn_multi_scale_v4_ordered_workers(params: SpawnWorkersParams) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_ordered_v4_histories()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns canonical exhaustive subsets without the exact upper-bound prune.
+fn spawn_multi_scale_v4_exhaustive_unpruned_workers(
+    params: SpawnWorkersParams,
+) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_exhaustive_v4_subsets()
+            .without_v4_upper_bound_pruning()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns maximal-frontier enumeration without the exact upper-bound prune.
+fn spawn_multi_scale_v4_maximal_unpruned_workers(
+    params: SpawnWorkersParams,
+) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_multi_scale_frontier()
+            .without_v4_upper_bound_pruning()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns maximal-frontier search with exact closure over every supported pair face.
+fn spawn_multi_scale_v4_certified_pair_face_workers(
+    params: SpawnWorkersParams,
+) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_certified_pair_face_closure()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns maximal-frontier V4 search with certified selective subset fallback.
+fn spawn_multi_scale_v4_certified_workers(params: SpawnWorkersParams) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .with_certified_v4_subset_fallback()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
 /// Spawns the native PathFrankWolfe algorithm without exact V2 refinement.
 fn spawn_native_path_frank_wolfe_workers(params: SpawnWorkersParams) -> Vec<JoinHandle<()>> {
     let factory = |config: AlgorithmConfig| {
         PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
-            .without_exact_v2_refinement()
+            .without_exact_extensions()
+    };
+    spawn_workers_generic(params, &factory)
+}
+
+/// Spawns the exact portfolio solver without V4 path discovery for comparisons.
+fn spawn_no_v4_exact_path_frank_wolfe_workers(params: SpawnWorkersParams) -> Vec<JoinHandle<()>> {
+    let factory = |config: AlgorithmConfig| {
+        PathFrankWolfeAlgorithm::new(config, PathFrankWolfeConfig::default())
+            .without_v4_exact_search()
     };
     spawn_workers_generic(params, &factory)
 }

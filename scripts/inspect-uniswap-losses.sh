@@ -11,7 +11,7 @@ if [[ -f "$REPO_ROOT/.env" ]]; then
   set +a
 fi
 
-RUN_DIR="${1:-bench-results/v2-v3-live}"
+RUN_DIR="${1:-artifacts/benchmarks/runs/v2-v3-live}"
 TOOL_DIR="$REPO_ROOT/tools/uniswap-router-bench"
 PUBLIC_ARCHIVE_RPC="https://ethereum-rpc.blockreq.com/v1/rpc/public"
 

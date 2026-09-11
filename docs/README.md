@@ -1,5 +1,5 @@
 ---
-description: The Open Source DEX Aggregator that runs on your hardware.
+description: Lexion's exact-replay hybrid DEX-routing system.
 icon: book-open
 layout:
   width: default
@@ -21,13 +21,19 @@ layout:
 
 # Overview
 
-## What is Fynd?
+## What is Lexion?
 
-Fynd is an open-source DEX aggregator that runs locally on your server. We built Fynd to be **reliable** and **trustless.**
+Lexion is a hybrid DEX-routing system built on Fynd's market ingestion, graph, and pool simulators.
+It adds resource-aware trace quotienting, maximal-frontier search, exact integer replay, certified
+allocation bounds, and bounded-quality elimination.
 
-Fynd gives you quotes in 20ms, supports 1.000 RPS on commodity hardware (see [performance](reference/benchmark-results.md)), does not overquote, and is configurable to the pools, tokens, and objectives you care about (low reverts, best price, low latency, etc.).
+The router runs locally and remains configurable for price, latency, reliability, and admitted
+protocol families. Performance claims in the research documents refer to pinned captures and named
+configurations, not a universal latency guarantee.
 
-Fynd builds on [Tycho](https://www.propellerheads.xyz/tycho) the open source DEX indexer (see the [protocols it supports](https://docs.propellerheads.xyz/tycho/for-solvers/supported-protocols)).
+Lexion builds on [Fynd](https://github.com/propeller-heads/fynd) and
+[Tycho](https://www.propellerheads.xyz/tycho). Existing `fynd-*` crate names are retained for
+upstream compatibility.
 
 
 ## Own Your Routing <a href="#own-your-dex-routing" id="own-your-dex-routing"></a>

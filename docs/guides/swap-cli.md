@@ -77,6 +77,16 @@ fynd-swap-cli \
 
 The output prints the quote (amount\_in, amount\_out, gas estimate, route) followed by the simulation result.
 
+To hold one signed quote fixed and replay it against consecutive mainnet heads without broadcasting,
+use shadow mode:
+
+```bash
+fynd-swap-cli --shadow-blocks 5
+```
+
+Each observation reports the current block, quote age, settled output, and simulated gas cost. This
+uses state overrides and `eth_call`; it does not require token balances and cannot spend real funds.
+
 {% hint style="info" %}
 `--sell-amount` is in raw atomic units. 1 000 000 000 = 1000 USDC (6 decimals). 1 000 000 000 000 000 000 = 1 WETH (18 decimals).
 {% endhint %}
@@ -136,6 +146,7 @@ fynd-swap-cli --transfer-type use-vaults-funds
 | `--fynd-url`      | `FYND_URL` | `http://localhost:3000`                     | Fynd server URL                                                 |
 | `--transfer-type` | —         | `transfer-from`                              | `transfer-from`, `transfer-from-permit2`, or `use-vaults-funds` |
 | `--execute`       | —         | false (dry-run)                              | Submit the swap on-chain. Requires `PRIVATE_KEY`.               |
+| `--shadow-blocks` | —         | 1                                            | Replay one signed quote at consecutive heads without broadcasting |
 | `--permit2`       | —         | `0x000000000022D473030F116dDEE9F6B43aC78BA3` | Permit2 contract address                                        |
 | `--rpc-url`       | `RPC_URL` | `https://reth-ethereum.ithaca.xyz/rpc`       | Ethereum RPC endpoint (must support `eth_call` state overrides) |
 

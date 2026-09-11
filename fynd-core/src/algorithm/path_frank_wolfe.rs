@@ -20,7 +20,7 @@ use tycho_simulation::tycho_core::models::Address;
 
 use super::{
     bellman_ford::{BellmanFordContext, FindRouteOptions},
-    exact_v2_refiner::refine_disjoint_allocations,
+    exact_v2_refiner::{refine_disjoint_allocations, ExactGasValuation},
     exact_v2_search::search_disjoint_portfolios,
     split_primitives::{
         build_post_swap_overrides, build_split_route, compute_marginal_price_product,
@@ -61,6 +61,15 @@ pub struct PathFrankWolfeAlgorithm {
     inner: BellmanFordAlgorithm,
     config: PathFrankWolfeConfig,
     exact_v2_refinement: bool,
+    exact_portfolio_search: bool,
+    v4_exact_search: bool,
+    v4_resource_quotient: bool,
+    v4_ordered_history_control: bool,
+    v4_upper_bound_pruning: bool,
+    certified_pair_face_closure: bool,
+    certified_v4_subset_fallback: bool,
+    multi_scale_frontier: bool,
+    exact_allocation_cutoff_centi_bps: u32,
     max_hops: usize,
 }
 
@@ -69,12 +78,94 @@ impl PathFrankWolfeAlgorithm {
     pub(crate) fn new(algorithm_config: AlgorithmConfig, config: PathFrankWolfeConfig) -> Self {
         let max_hops = algorithm_config.max_hops();
         let inner = BellmanFordAlgorithm::with_config(algorithm_config);
-        Self { inner, config, exact_v2_refinement: true, max_hops }
+        Self {
+            inner,
+            config,
+            exact_v2_refinement: true,
+            exact_portfolio_search: true,
+            v4_exact_search: true,
+            v4_resource_quotient: true,
+            v4_ordered_history_control: false,
+            v4_upper_bound_pruning: true,
+            certified_pair_face_closure: false,
+            certified_v4_subset_fallback: false,
+            multi_scale_frontier: false,
+            exact_allocation_cutoff_centi_bps: 0,
+            max_hops,
+        }
     }
 
-    /// Disables exact Uniswap V2 allocation refinement for controlled comparisons.
-    pub(crate) fn without_exact_v2_refinement(mut self) -> Self {
+    /// Disables every exact extension, leaving native Path Frank-Wolfe as the control.
+    pub(crate) fn without_exact_extensions(mut self) -> Self {
         self.exact_v2_refinement = false;
+        self.exact_portfolio_search = false;
+        self
+    }
+
+    /// Retains local exact reallocation but disables independent exact portfolio discovery.
+    pub(crate) fn with_local_exact_refinement_only(mut self) -> Self {
+        self.exact_portfolio_search = false;
+        self
+    }
+
+    /// Excludes V4 only from exact portfolio discovery for controlled comparisons.
+    pub(crate) fn without_v4_exact_search(mut self) -> Self {
+        self.v4_exact_search = false;
+        self
+    }
+
+    /// Preserves paths that are competitive only for a small share of the order.
+    pub(crate) fn with_multi_scale_frontier(mut self) -> Self {
+        self.multi_scale_frontier = true;
+        self
+    }
+
+    /// Allows exact allocation search to stop within the given hundredth-of-a-basis-point bound.
+    pub(crate) fn with_exact_allocation_cutoff(mut self, centi_bps: u32) -> Self {
+        self.exact_allocation_cutoff_centi_bps = centi_bps;
+        self
+    }
+
+    /// Enables multi-scale discovery while excluding V4 exact portfolio search.
+    pub(crate) fn with_multi_scale_frontier_without_v4(mut self) -> Self {
+        self.multi_scale_frontier = true;
+        self.v4_exact_search = false;
+        self
+    }
+
+    /// Enumerates compatible V4 subsets instead of quotienting them by maximal resource frontier.
+    pub(crate) fn with_exhaustive_v4_subsets(mut self) -> Self {
+        self.multi_scale_frontier = true;
+        self.v4_resource_quotient = false;
+        self
+    }
+
+    /// Enumerates every order of every compatible V4 subset as an analysis control.
+    pub(crate) fn with_ordered_v4_histories(mut self) -> Self {
+        self.multi_scale_frontier = true;
+        self.v4_resource_quotient = false;
+        self.v4_ordered_history_control = true;
+        self.v4_upper_bound_pruning = false;
+        self
+    }
+
+    /// Disables the exact V4 upper-bound prune while retaining portfolio enumeration.
+    pub(crate) fn without_v4_upper_bound_pruning(mut self) -> Self {
+        self.v4_upper_bound_pruning = false;
+        self
+    }
+
+    /// Exactly optimizes every supported one- and two-path face of each maximal V4 frontier.
+    pub(crate) fn with_certified_pair_face_closure(mut self) -> Self {
+        self.multi_scale_frontier = true;
+        self.certified_pair_face_closure = true;
+        self
+    }
+
+    /// Uses the maximal-frontier result as an incumbent, then checks every uncertified subset.
+    pub(crate) fn with_certified_v4_subset_fallback(mut self) -> Self {
+        self.multi_scale_frontier = true;
+        self.certified_v4_subset_fallback = true;
         self
     }
 }
@@ -274,7 +365,7 @@ impl PathFrankWolfeAlgorithm {
     ///
     /// Returns `0.0` when the gas price or the output token's price is
     /// unavailable — gas is then simply not part of the objective.
-    fn gas_units_to_output_tokens(
+    pub(super) fn gas_units_to_output_tokens(
         gas: &BigUint,
         output_token: &Address,
         ctx: &BellmanFordContext,
@@ -294,6 +385,23 @@ impl PathFrankWolfeAlgorithm {
         let gas_cost_wei = gas * gas_price;
         let gas_cost_tokens = &gas_cost_wei * &price.numerator / &price.denominator;
         gas_cost_tokens.to_f64().unwrap_or(0.0)
+    }
+
+    /// Returns the exact gas conversion used by allocation certificates.
+    pub(super) fn exact_gas_valuation(
+        output_token: &Address,
+        ctx: &BellmanFordContext,
+    ) -> Option<ExactGasValuation> {
+        let gas_price = ctx
+            .gas_price_wei
+            .as_ref()
+            .filter(|price| !price.is_zero())?;
+        let price = ctx
+            .token_prices
+            .as_ref()?
+            .get(output_token)
+            .filter(|price| !price.denominator.is_zero())?;
+        ExactGasValuation::new(gas_price * &price.numerator, price.denominator.clone())
     }
 
     /// Converts a `Route` (from BF's initial solve) into a single `PathAllocation`.
@@ -589,9 +697,29 @@ impl PathFrankWolfeAlgorithm {
         }
 
         if self.exact_v2_refinement {
-            if let Some(refined) =
-                refine_disjoint_allocations(&allocations, total_amount, &ctx.market_data)?
-            {
+            let gas_cost_per_unit = allocations
+                .first()
+                .and_then(|path| path.hops.last())
+                .map(|hop| {
+                    Self::gas_units_to_output_tokens(
+                        &BigUint::from(1u8),
+                        &hop.descriptor.token_out.address,
+                        ctx,
+                    )
+                })
+                .unwrap_or_default();
+            let exact_gas_valuation = allocations
+                .first()
+                .and_then(|path| path.hops.last())
+                .and_then(|hop| Self::exact_gas_valuation(&hop.descriptor.token_out.address, ctx));
+            if let Some(refined) = refine_disjoint_allocations(
+                &allocations,
+                total_amount,
+                &ctx.market_data,
+                gas_cost_per_unit,
+                exact_gas_valuation.as_ref(),
+                self.exact_allocation_cutoff_centi_bps,
+            )? {
                 let native_route = build_split_route(&allocations, &ctx.market_data, order)?;
                 let refined_route = build_split_route(&refined, &ctx.market_data, order)?;
                 if refined_route.validate().is_ok() &&
@@ -637,7 +765,7 @@ impl PathFrankWolfeAlgorithm {
 
     /// Computes `net_amount_out` for a split route, mirroring
     /// `BellmanFordAlgorithm::compute_net_amount_out`.
-    fn compute_split_net_amount_out(
+    pub(super) fn compute_split_net_amount_out(
         route: &Route,
         ctx: &BellmanFordContext,
     ) -> Result<BigInt, AlgorithmError> {
@@ -668,9 +796,22 @@ impl PathFrankWolfeAlgorithm {
     ) -> Result<Option<RouteResult>, AlgorithmError> {
         let mut best_net = floor.net_amount_out().clone();
         let mut best = None;
-        for allocations in
-            search_disjoint_portfolios(ctx, order.amount(), self.max_hops, self.config.max_paths)?
-        {
+        for allocations in search_disjoint_portfolios(
+            ctx,
+            order,
+            order.amount(),
+            self.max_hops,
+            self.config.max_paths,
+            self.multi_scale_frontier,
+            self.v4_exact_search,
+            self.v4_resource_quotient,
+            self.v4_ordered_history_control,
+            self.v4_upper_bound_pruning,
+            self.certified_pair_face_closure,
+            self.certified_v4_subset_fallback,
+            self.exact_allocation_cutoff_centi_bps,
+            floor.net_amount_out(),
+        )? {
             if start.elapsed() >= self.timeout() {
                 break;
             }
@@ -776,7 +917,7 @@ impl Algorithm for PathFrankWolfeAlgorithm {
         };
 
         // Step 4: independently search compatible V2/V3 path portfolios and accept only a net win.
-        if self.exact_v2_refinement {
+        if self.exact_portfolio_search {
             match self.search_exact_disjoint(&ctx, order, &native, start) {
                 Ok(Some(exact)) => return Ok(exact),
                 Ok(None) => {}

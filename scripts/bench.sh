@@ -2,7 +2,7 @@
 # Compare the routing algorithms against the recorded market fixture.
 #
 # Builds fynd-core/benches/algorithm_bench.rs with release optimisations plus debug symbols and
-# runs it. Every run writes bench-results/<name>/ holding report.md, orders.csv, pairs.csv,
+# runs it. Every run writes artifacts/benchmarks/runs/<name>/ holding report.md, orders.csv, pairs.csv,
 # protocols.csv, routes.jsonl and run.json, so runs can be compared rather than overwritten.
 # Browse them with ./scripts/bench-viewer.sh.
 #

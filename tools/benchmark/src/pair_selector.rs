@@ -3,7 +3,7 @@
 //! Used by the `audit` subcommand to derive what to benchmark from the existing
 //! aggregator trade dataset rather than requiring separate configuration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use num_bigint::BigUint;
 
@@ -20,6 +20,8 @@ pub struct PairSpec {
     pub token_out: String,
     /// `amounts_per_pair` representative amounts derived from percentiles of real trades.
     pub amounts: Vec<String>,
+    /// Size bucket aligned with `amounts` (`small`, `medium`, or `large`).
+    pub size_buckets: Vec<String>,
 }
 
 /// Returns `(decimals, approx_usd_price_per_whole_token)` for well-known tokens.
@@ -108,11 +110,116 @@ pub fn select_top_pairs(
             PairSpec {
                 label: format!("{in_sym} → {out_sym}"),
                 amounts: percentile_sample(&amounts, amounts_per_pair),
+                size_buckets: percentile_buckets(amounts_per_pair),
                 token_in,
                 token_out,
             }
         })
         .collect()
+}
+
+/// Select reproducible random historical orders, balanced across directional pairs and amount
+/// terciles. Each returned [`PairSpec`] contains one order so no percentile synthesis is involved.
+pub fn select_random_stratified_orders(
+    trades: &[SwapRequest],
+    top_n_pairs: usize,
+    order_count: usize,
+    seed: u64,
+    min_amount_usd: f64,
+) -> Vec<PairSpec> {
+    let mut grouped: HashMap<(String, String), Vec<BigUint>> = HashMap::new();
+    for trade in trades {
+        let key = (trade.token_in_addr().to_lowercase(), trade.token_out_addr().to_lowercase());
+        if let Ok(amount) = trade.raw_amount().parse::<BigUint>() {
+            if amount == BigUint::default() || !meets_min_usd(&key.0, &amount, min_amount_usd) {
+                continue;
+            }
+            grouped
+                .entry(key)
+                .or_default()
+                .push(amount);
+        }
+    }
+
+    let mut ranked: Vec<_> = grouped.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.truncate(top_n_pairs);
+
+    let mut strata = Vec::new();
+    for ((token_in, token_out), mut amounts) in ranked {
+        amounts.sort_unstable();
+        amounts.dedup();
+        for bucket in 0..3 {
+            let start = amounts.len() * bucket / 3;
+            let end = amounts.len() * (bucket + 1) / 3;
+            if start < end {
+                strata.push((
+                    token_in.clone(),
+                    token_out.clone(),
+                    bucket,
+                    amounts[start..end].to_vec(),
+                ));
+            }
+        }
+    }
+
+    let mut rng = fastrand::Rng::with_seed(seed);
+    for (_, _, _, amounts) in &mut strata {
+        rng.shuffle(amounts);
+    }
+    rng.shuffle(&mut strata);
+
+    let mut selected = Vec::with_capacity(order_count);
+    let mut seen = HashSet::new();
+    let mut round = 0;
+    while selected.len() < order_count {
+        let mut added = false;
+        for (token_in, token_out, bucket, amounts) in &strata {
+            let Some(amount) = amounts.get(round) else { continue };
+            let amount = amount.to_string();
+            if seen.insert((token_in.clone(), token_out.clone(), amount.clone())) {
+                let in_sym = lookup_symbol(token_in);
+                let out_sym = lookup_symbol(token_out);
+                selected.push(PairSpec {
+                    label: format!("{in_sym} → {out_sym}"),
+                    token_in: token_in.clone(),
+                    token_out: token_out.clone(),
+                    amounts: vec![amount],
+                    size_buckets: vec![bucket_name(*bucket).to_string()],
+                });
+                added = true;
+                if selected.len() == order_count {
+                    break;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+        round += 1;
+    }
+    selected
+}
+
+fn percentile_buckets(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            let bucket = if n <= 1 { 1 } else { i * 3 / n };
+            bucket_name(bucket.min(2)).to_string()
+        })
+        .collect()
+}
+
+fn bucket_name(bucket: usize) -> &'static str {
+    match bucket {
+        0 => "small",
+        1 => "medium",
+        _ => "large",
+    }
 }
 
 /// Sample `n` values at evenly-spaced percentiles from a pre-sorted slice.
@@ -251,5 +358,53 @@ mod tests {
         let trades = vec![make_trade(unknown, usdc, "1")];
         let pairs = select_top_pairs(&trades, 1, 1, 250.0);
         assert_eq!(pairs.len(), 1, "unknown token should not be filtered");
+    }
+
+    #[test]
+    fn random_stratified_orders_are_seeded_and_balanced() {
+        let weth = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+        let usdc = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let usdt = "0xdac17f958d2ee523a2206206994597c13d831ec7";
+        let mut trades = Vec::new();
+        for amount in 1..=12 {
+            trades.push(make_trade(weth, usdc, &amount.to_string()));
+            trades.push(make_trade(usdt, usdc, &amount.to_string()));
+        }
+
+        let a = select_random_stratified_orders(&trades, 2, 12, 7, 0.0);
+        let b = select_random_stratified_orders(&trades, 2, 12, 7, 0.0);
+        assert_eq!(a.len(), 12);
+        assert_eq!(
+            a.iter()
+                .map(|p| (&p.token_in, &p.token_out, &p.amounts, &p.size_buckets))
+                .collect::<Vec<_>>(),
+            b.iter()
+                .map(|p| (&p.token_in, &p.token_out, &p.amounts, &p.size_buckets))
+                .collect::<Vec<_>>()
+        );
+        for bucket in ["small", "medium", "large"] {
+            assert_eq!(
+                a.iter()
+                    .filter(|p| p.size_buckets[0] == bucket)
+                    .count(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn random_stratified_orders_change_with_seed() {
+        let weth = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+        let usdc = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+        let trades: Vec<_> = (1..=30)
+            .map(|amount| make_trade(weth, usdc, &amount.to_string()))
+            .collect();
+        let amounts = |seed| {
+            select_random_stratified_orders(&trades, 1, 6, seed, 0.0)
+                .into_iter()
+                .map(|p| p.amounts[0].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(amounts(1), amounts(2));
     }
 }
