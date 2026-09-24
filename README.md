@@ -87,6 +87,9 @@ cargo test
 The retained experimental results, methodology, and limitations are documented in
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
+For a concise engineering case study covering the problem, architecture, decisions, evidence, and
+lessons, see [`PORTFOLIO.md`](PORTFOLIO.md).
+
 ## License
 
 MIT
